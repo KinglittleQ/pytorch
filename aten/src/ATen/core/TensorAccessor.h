@@ -1,6 +1,7 @@
 #pragma once
 
 #include <c10/macros/Macros.h>
+#include <c10/util/ArrayRef.h>
 #include <c10/util/Deprecated.h>
 #include <c10/util/Exception.h>
 #include <c10/util/irange.h>
@@ -159,7 +160,7 @@ protected:
   index_t strides_[N];
   C10_HOST void bounds_check_(index_t i) const {
     TORCH_CHECK_INDEX(
-        0 <= i && i < N,
+        0 <= i && i < index_t{N},
         "Index ",
         i,
         " is not within bounds of a tensor of dimension ",

@@ -1,6 +1,8 @@
 #include <torch/csrc/jit/passes/onnx/preprocess_for_onnx.h>
 
+#include <ATen/ScalarOps.h>
 #include <c10/util/irange.h>
+
 #include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/jit/passes/onnx/helper.h>
 
@@ -36,7 +38,7 @@ at::optional<Node*> FindFusibleListUnpack(Node* n) {
 // that the symbolic function is aware of the number of outputs.
 //
 // Example IR
-//  split.Tensor(Tensor(a) self, int split_size, int dim=0) -> Tensor(a)[]
+//  split.Tensor(Tensor(a -> *) self, int split_size, int dim=0) -> Tensor[]
 //  split_with_sizes(Tensor self, int[] split_sizes, int dim=0) -> Tensor[]
 //
 // graph(%input : Float(5, 4, 3, strides=[12, 3, 1])):

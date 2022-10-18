@@ -6,6 +6,16 @@
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
 #include <torch/csrc/jit/passes/onnx/helper.h>
 
+#include <ATen/ScalarOps.h>
+
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/Functions.h>
+#include <ATen/NativeFunctions.h>
+#else
+#include <ATen/ops/full.h>
+#include <ATen/ops/ones_like_native.h>
+#endif
+
 #include <c10/util/Optional.h>
 
 #if defined(_MSC_VER)
@@ -46,11 +56,11 @@ bool isNopTranspose(const std::vector<int64_t>& perm) {
 std::vector<int64_t> composeTransposes(
     const std::vector<int64_t>& t1,
     const std::vector<int64_t>& t2) {
-  AT_ASSERT(t1.size() == t2.size());
+  TORCH_INTERNAL_ASSERT(t1.size() == t2.size());
   std::vector<int64_t> ret;
   ret.reserve(t1.size());
   for (const auto& i : t2) {
-    AT_ASSERT(i < int64_t(t1.size()));
+    TORCH_INTERNAL_ASSERT(i < int64_t(t1.size()));
     ret.push_back(t1[i]);
   }
   return ret;
@@ -121,7 +131,7 @@ void fuseBroadcast(Block* b) {
 
     auto broadcast_positions = getBroadcastPositions(n);
     if (!broadcast_positions.empty()) {
-      AT_ASSERT(!n->hasAttribute(attr::axis));
+      TORCH_INTERNAL_ASSERT(!n->hasAttribute(attr::axis));
     }
 
     for (size_t position : broadcast_positions) {
@@ -617,7 +627,7 @@ static void speculateOps(Block* block) {
 static void replaceInputWithList(Node* node, size_t i, ArrayRef<Value*> to) {
   node->removeInput(i);
   for (auto* to_val : to) {
-    AT_ASSERT(to_val->owningGraph() == node->owningGraph());
+    TORCH_INTERNAL_ASSERT(to_val->owningGraph() == node->owningGraph());
     node->insertInput(i++, to_val);
   }
 }
@@ -747,6 +757,32 @@ static void fuseListConstructListUnpack(Block* b) {
         auto output = it->outputs().at(i);
         output->replaceAllUsesWith(it->input()->node()->inputs().at(i));
       }
+    }
+  }
+}
+
+// https://github.com/pytorch/pytorch/wiki/PyTorch-ONNX-exporter#quantized-model-export
+static void eraseTupleConstruct(Block* block) {
+  std::vector<Value*> new_block_outputs;
+  bool found_tuple_construct = false;
+  // TupleConstruct is generated from the symbolics in quantized domain, and
+  // consumed by other quantized operators. The remained TupleConstruct should
+  // be at the output of the blocks.
+  for (auto* output : block->outputs()) {
+    auto output_node = output->node();
+    if (output_node->kind() == prim::TupleConstruct) {
+      found_tuple_construct = true;
+      for (auto* input : output_node->inputs()) {
+        new_block_outputs.emplace_back(input);
+      }
+    } else {
+      new_block_outputs.emplace_back(output);
+    }
+  }
+  if (found_tuple_construct) {
+    block->removeAllOutputs();
+    for (auto* output : new_block_outputs) {
+      block->registerOutput(output);
     }
   }
 }
@@ -1015,6 +1051,7 @@ void PeepholeOptimizeONNX(
   fuseListConstructListUnpack(graph->block());
   fuseLogSoftmaxNllLoss(graph->block());
   eraseListConstruct(graph->block(), opset_version);
+  eraseTupleConstruct(graph->block());
   EliminateDeadCode(
       graph->block(),
       true,

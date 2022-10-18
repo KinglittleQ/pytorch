@@ -64,22 +64,10 @@ void GraphFunction::run(Stack& stack) {
   get_executor().run(stack);
 }
 
-void GraphFunction::run(Stack&& stack) {
-  run(stack);
-}
-
 c10::intrusive_ptr<c10::ivalue::Future> GraphFunction::runAsync(
     Stack& stack,
     TaskLauncher taskLauncher) {
   return get_executor().runAsync(stack, std::move(taskLauncher));
-}
-
-IValue GraphFunction::operator()(
-    std::vector<IValue> stack,
-    const Kwargs& kwargs) {
-  getSchema().checkAndNormalizeInputs(stack, kwargs);
-  run(stack);
-  return stack.front();
 }
 
 void GraphFunction::ensure_defined() {
@@ -100,6 +88,9 @@ const c10::FunctionSchema& GraphFunction::getSchema() const {
 }
 
 GraphFunction::SpecializationKey GraphFunction::currentSpecialization() const {
+  if (force_no_amp_) {
+    return SpecializationKey::AutocastOff;
+  }
 #ifdef C10_MOBILE
   // disabling autodiff pass for mobile build since autocast APIs don't exist
   return SpecializationKey::AutocastOff;
@@ -117,7 +108,7 @@ GraphFunction::SpecializationKey GraphFunction::currentSpecialization() const {
 #endif
 }
 
-void preoptimizeGraph(std::shared_ptr<Graph>& graph) {
+void preoptimizeGraph(std::shared_ptr<Graph>& graph, bool disable_autocast) {
   Inline(*graph);
 
   // Peephole Optimize cleans up many "is None" checks and creates constant prop
@@ -137,7 +128,9 @@ void preoptimizeGraph(std::shared_ptr<Graph>& graph) {
   //     of the any optimizations
   //  2. AMP transformations would benefit from followup passes's cleanup
   //
-  Autocast(graph);
+  if (!disable_autocast) {
+    Autocast(graph);
+  }
 #endif
 
   ConstantPooling(graph);

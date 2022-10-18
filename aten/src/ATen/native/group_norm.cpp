@@ -16,6 +16,39 @@
 namespace at {
 namespace native {
 
+void check_group_norm_inputs(
+    const Tensor& input,
+    const Tensor& weight,
+    const Tensor& bias,
+    int64_t C,
+    int64_t num_groups) {
+  TORCH_CHECK(
+      num_groups > 0,
+      "Expected num groups to be greater than 0, got ", num_groups);
+  TORCH_CHECK(
+      C % num_groups == 0,
+      "Expected number of channels in input to be divisible by ",
+      "num_groups, but got input of shape ",
+      input.sizes(),
+      " and "
+      "num_groups=",
+      num_groups);
+  TORCH_CHECK(
+      !weight.defined() || (weight.dim() == 1 && weight.numel() == C),
+      "Expected weight to be a vector of size equal to the number of ",
+      "channels in input, but got weight of shape ",
+      weight.sizes(),
+      " and input of shape ",
+      input.sizes());
+  TORCH_CHECK(
+      !bias.defined() || (bias.dim() == 1 && bias.numel() == C),
+      "Expected bias to be a vector of size equal to the number of ",
+      "channels in input, but got bias of shape ",
+      weight.sizes(),
+      " and input of shape ",
+      input.sizes());
+}
+
 std::tuple<Tensor, Tensor, Tensor> native_group_norm(
     const Tensor& X,
     const c10::optional<Tensor>& gamma_opt /* optional */,
@@ -31,6 +64,9 @@ std::tuple<Tensor, Tensor, Tensor> native_group_norm(
   const Tensor& gamma = *gamma_maybe_owned;
   const Tensor& beta = c10::value_or_else(beta_opt, [] { return Tensor(); });
 
+  // repeated check so expanded weights can call native_group_norm directly but
+  // save mean and variance from forward
+  check_group_norm_inputs(X, gamma, beta, C, group);
   auto memory_format = X.device().is_cpu() ?
       X.suggest_memory_format() : at::MemoryFormat::Contiguous;
 
@@ -128,28 +164,7 @@ Tensor group_norm(
 
   const int64_t N = input.size(0);
   const int64_t C = input.size(1);
-  TORCH_CHECK(
-      C % num_groups == 0,
-      "Expected number of channels in input to be divisible by ",
-      "num_groups, but got input of shape ",
-      input.sizes(),
-      " and "
-      "num_groups=",
-      num_groups);
-  TORCH_CHECK(
-      !weight.defined() || (weight.dim() == 1 && weight.numel() == C),
-      "Expected weight to be a vector of size equal to the number of ",
-      "channels in input, but got weight of shape ",
-      weight.sizes(),
-      " and input of shape ",
-      input.sizes());
-  TORCH_CHECK(
-      !bias.defined() || (bias.dim() == 1 && bias.numel() == C),
-      "Expected bias to be a vector of size equal to the number of ",
-      "channels in input, but got bias of shape ",
-      weight.sizes(),
-      " and input of shape ",
-      input.sizes());
+  check_group_norm_inputs(input, weight, bias, C, num_groups);
 
   const auto input_shape = input.sizes();
   const int64_t HxW =
@@ -209,8 +224,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> math_group_norm(
   } else if (bias.defined()) {
     out = out.add(bias.view(affine_param_shape));
   }
-  at::Tensor mean = std::get<1>(outputs).view({N, group});
-  at::Tensor rstd = std::get<2>(outputs).view({N, group});
+  // convert mean/std to have the same dtype as input.
+  // This follows the same behavior as the CPU and CUDA kernels.
+  at::Tensor mean = std::get<1>(outputs).to(c10::TensorOptions().dtype(input.scalar_type())).view({N, group});
+  at::Tensor rstd = std::get<2>(outputs).to(c10::TensorOptions().dtype(input.scalar_type())).view({N, group});
   return std::make_tuple(out, mean, rstd);
 }
 } // namespace native

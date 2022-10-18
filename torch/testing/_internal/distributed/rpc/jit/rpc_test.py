@@ -153,8 +153,11 @@ def record_function_on_caller_rpc_async(dst_worker_name: str, block: str) -> Ten
     t: Tensor = torch.ones(1)
     with record_function(block) as rf:
         fut1 = rpc.rpc_async(dst_worker_name, script_add_ones, (t, ))
+        # Extra operator call to avoid de-duplication of the next async call
+        # see https://github.com/pytorch/pytorch/pull/62710#discussion_r694680279
+        zero = torch.zeros_like(t)
         fut2 = rpc.rpc_async(dst_worker_name, script_add_ones, (t, ))
-        res = fut1.wait() + fut2.wait()
+        res = fut1.wait() + fut2.wait() + zero
     return res
 
 
@@ -423,7 +426,7 @@ class LocalRRefTest:
 
         dst_worker_name = worker_name((self.rank + 1) % self.world_size)
 
-        # Create a local RRef<MyScripClass> remotely in Python.
+        # Create a local RRef<MyScriptClass> remotely in Python.
         rref = rpc.rpc_sync(
             dst_worker_name, owner_create_rref_my_script_class, args=(self.rank,)
         )
@@ -437,7 +440,7 @@ class LocalRRefTest:
             ret = fut.wait()
             return ret
 
-        # Use RRef<MyScripClass> in local Python RPC and remote Script run.
+        # Use RRef<MyScriptClass> in local Python RPC and remote Script run.
         ret = use_rref_on_owner(rref)
         self.assertEqual(ret, self.rank)
 
@@ -470,7 +473,7 @@ class LocalRRefTest:
             ret = fut.wait()
             return ret
 
-        # Use RRef<MyScripClass> in local Python RPC and remote Script run.
+        # Use RRef<MyScriptClass> in local Python RPC and remote Script run.
         ret = use_rref_on_owner(rref)
         self.assertEqual(ret, torch.ones(self.rank))
 

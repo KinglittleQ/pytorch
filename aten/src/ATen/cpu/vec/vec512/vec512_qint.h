@@ -5,7 +5,7 @@
 
 #include <ATen/cpu/vec/intrinsics.h>
 #include <ATen/cpu/vec/vec_base.h>
-#include <ATen/native/quantized/affine_quantizer_base.h>
+#include <ATen/native/quantized/AffineQuantizerBase.h>
 
 #include <c10/util/irange.h>
 #include <c10/util/qint32.h>
@@ -39,7 +39,7 @@
 
 namespace at {
 namespace vec {
-namespace {
+inline namespace CPU_CAPABILITY {
 
 #if defined(CPU_CAPABILITY_AVX512) && !defined(_MSC_VER)
 
@@ -64,7 +64,7 @@ __m512i pack_saturate_and_clamp(
     T max_val);
 
 template <>
-__m512i pack_saturate_and_clamp<int32_t>(
+inline __m512i pack_saturate_and_clamp<int32_t>(
     __m512i first,
     __m512i second,
     int32_t min_val,
@@ -74,7 +74,7 @@ __m512i pack_saturate_and_clamp<int32_t>(
 }
 
 template <>
-__m512i pack_saturate_and_clamp<int8_t>(
+inline __m512i pack_saturate_and_clamp<int8_t>(
     __m512i first,
     __m512i second,
     int8_t min_val,
@@ -86,7 +86,7 @@ __m512i pack_saturate_and_clamp<int8_t>(
 }
 
 template <>
-__m512i pack_saturate_and_clamp<uint8_t>(
+inline __m512i pack_saturate_and_clamp<uint8_t>(
     __m512i first,
     __m512i second,
     uint8_t min_val,
@@ -268,6 +268,18 @@ struct Vectorized<c10::qint32> : public Vectorizedqi {
         return Vectorized<c10::qint32>(ptr);
     }
 
+    static Vectorized<c10::qint32> loadu(const void* ptr, int64_t count) {
+        __at_align__ value_type tmp_values[size()];
+        // Ensure uninitialized memory does not change the output value See https://github.com/pytorch/pytorch/issues/32502
+        // for more details. We do not initialize arrays to zero using "={0}" because gcc would compile it to two
+        // instructions while a loop would be compiled to one instruction.
+        for (const auto i : c10::irange(size())) {
+          tmp_values[i] = 0;
+        }
+        std::memcpy(tmp_values, reinterpret_cast<const value_type*>(ptr), count * sizeof(value_type));
+        return loadu(tmp_values);
+    }
+
     float_vec_return_type dequantize(
         Vectorized<float> scale,
         Vectorized<float> zero_point,
@@ -430,6 +442,11 @@ struct Vectorized<c10::qint8> : public Vectorizedqi {
     // constructor for moving the enum
     Vectorized(const Vectorized<c10::qint8>& other) : Vectorizedqi(other.vals) { }
 
+    // This is added to avoid error: definition of implicit copy assignment operator
+    // for 'Vectorized<c10::qint8>' is deprecated because it has a user-declared
+    // copy constructor [-Werror,-Wdeprecated-copy]
+    Vectorized& operator=(const Vectorized<c10::qint8>&) = default;
+
     void store(void* ptr, int count = size()) const {
         if (count != size()) {
             memcpy(ptr, &vals, count * sizeof(value_type));
@@ -440,6 +457,18 @@ struct Vectorized<c10::qint8> : public Vectorizedqi {
 
     static Vectorized<c10::qint8> loadu(const void* ptr) {
         return Vectorized<c10::qint8>(ptr);
+    }
+
+    static Vectorized<c10::qint8> loadu(const void* ptr, int64_t count) {
+        __at_align__ value_type tmp_values[size()];
+        // Ensure uninitialized memory does not change the output value See https://github.com/pytorch/pytorch/issues/32502
+        // for more details. We do not initialize arrays to zero using "={0}" because gcc would compile it to two
+        // instructions while a loop would be compiled to one instruction.
+        for (const auto i : c10::irange(size())) {
+          tmp_values[i] = 0;
+        }
+        std::memcpy(tmp_values, reinterpret_cast<const value_type*>(ptr), count * sizeof(value_type));
+        return loadu(tmp_values);
     }
 
  private:
@@ -589,6 +618,11 @@ struct Vectorized<c10::quint8> : public Vectorizedqi {
 
     Vectorized(const Vectorized<c10::quint8>& other) : Vectorizedqi(other.vals) { }
 
+    // This is added to avoid error: definition of implicit copy assignment operator
+    // for 'Vectorized<c10::quint8>' is deprecated because it has a user-declared
+    // copy constructor [-Werror,-Wdeprecated-copy]
+    Vectorized& operator=(const Vectorized<c10::quint8>&) = default;
+
     void store(void* ptr, int count = size()) const {
         if (count != size()) {
             memcpy(ptr, &vals, count * sizeof(value_type));
@@ -599,6 +633,18 @@ struct Vectorized<c10::quint8> : public Vectorizedqi {
 
     static Vectorized<c10::quint8> loadu(const void* ptr) {
         return Vectorized<c10::quint8>(ptr);
+    }
+
+    static Vectorized<c10::quint8> loadu(const void* ptr, int64_t count) {
+        __at_align__ value_type tmp_values[size()];
+        // Ensure uninitialized memory does not change the output value See https://github.com/pytorch/pytorch/issues/32502
+        // for more details. We do not initialize arrays to zero using "={0}" because gcc would compile it to two
+        // instructions while a loop would be compiled to one instruction.
+        for (const auto i : c10::irange(size())) {
+          tmp_values[i] = 0;
+        }
+        std::memcpy(tmp_values, reinterpret_cast<const value_type*>(ptr), count * sizeof(value_type));
+        return loadu(tmp_values);
     }
 
  private:
@@ -823,6 +869,18 @@ struct Vectorized<c10::qint32> : public VectorizedQuantizedConverter<
     return Vectorized<c10::qint32>(ptr);
   }
 
+  static Vectorized<c10::qint32> loadu(const void* ptr, int64_t count) {
+    __at_align__ value_type tmp_values[size()];
+    // Ensure uninitialized memory does not change the output value See https://github.com/pytorch/pytorch/issues/32502
+    // for more details. We do not initialize arrays to zero using "={0}" because gcc would compile it to two
+    // instructions while a loop would be compiled to one instruction.
+    for (const auto i : c10::irange(size())) {
+      tmp_values[i] = 0;
+    }
+    std::memcpy(tmp_values, reinterpret_cast<const value_type*>(ptr), count * sizeof(value_type));
+    return loadu(tmp_values);
+  }
+
   static Vectorized<c10::qint32> quantize(
       const float_vec_return_type& rhs,
       float scale,
@@ -909,7 +967,7 @@ Vectorized<c10::qint32> inline operator*(
     const Vectorized<c10::qint32>& a,
     const Vectorized<c10::qint32>& b) {
   Vectorized<c10::qint32> retval;
-  for (size_t i = 0; i < std::decay_t<decltype(a)>::size(); ++i) {
+  for (const auto i : c10::irange(std::decay_t<decltype(a)>::size())) {
     retval.vals[i] = a.vals[i] * b.vals[i];
   }
   return retval;
@@ -920,7 +978,7 @@ Vectorized<c10::qint32> inline operator+(
     const Vectorized<c10::qint32>& a,
     const Vectorized<c10::qint32>& b) {
   Vectorized<c10::qint32> retval;
-  for (size_t i = 0; i < std::decay_t<decltype(a)>::size(); ++i) {
+  for (const auto i : c10::irange(std::decay_t<decltype(a)>::size())) {
     retval.vals[i] = a.vals[i] + b.vals[i];
   }
   return retval;
@@ -953,6 +1011,18 @@ struct Vectorized<c10::qint8> : public VectorizedQuantizedConverter<
 
   static Vectorized<c10::qint8> loadu(const void* ptr) {
     return Vectorized<c10::qint8>(ptr);
+  }
+
+  static Vectorized<c10::qint8> loadu(const void* ptr, int64_t count) {
+    __at_align__ value_type tmp_values[size()];
+    // Ensure uninitialized memory does not change the output value See https://github.com/pytorch/pytorch/issues/32502
+    // for more details. We do not initialize arrays to zero using "={0}" because gcc would compile it to two
+    // instructions while a loop would be compiled to one instruction.
+    for (const auto i : c10::irange(size())) {
+      tmp_values[i] = 0;
+    }
+    std::memcpy(tmp_values, reinterpret_cast<const value_type*>(ptr), count * sizeof(value_type));
+    return loadu(tmp_values);
   }
 
   static Vectorized<c10::qint8> quantize(
@@ -1073,6 +1143,18 @@ struct Vectorized<c10::quint8> : public VectorizedQuantizedConverter<
 
   static Vectorized<c10::quint8> loadu(const void* ptr) {
     return Vectorized<c10::quint8>(ptr);
+  }
+
+  static Vectorized<c10::quint8> loadu(const void* ptr, int64_t count) {
+    __at_align__ value_type tmp_values[size()];
+    // Ensure uninitialized memory does not change the output value See https://github.com/pytorch/pytorch/issues/32502
+    // for more details. We do not initialize arrays to zero using "={0}" because gcc would compile it to two
+    // instructions while a loop would be compiled to one instruction.
+    for (const auto i : c10::irange(size())) {
+      tmp_values[i] = 0;
+    }
+    std::memcpy(tmp_values, reinterpret_cast<const value_type*>(ptr), count * sizeof(value_type));
+    return loadu(tmp_values);
   }
 
   static Vectorized<c10::quint8> quantize(

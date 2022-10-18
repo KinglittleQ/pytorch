@@ -4,6 +4,8 @@ import torch.optim._functional as F
 
 from torch import Tensor
 
+__all__ : List[str] = []
+
 # Define a TorchScript compatible Functional SGD Optimizer
 # where we use these optimizer in a functional way.
 # Instead of using the `param.grad` when updating parameters,
@@ -23,7 +25,9 @@ class _FunctionalSGD(object):
         dampening: float = 0.0,
         weight_decay: float = 0.0,
         nesterov: bool = False,
-        _allow_empty_param_list: bool = False
+        maximize: bool = False,
+        foreach: bool = False,
+        _allow_empty_param_list: bool = False,
     ):
         self.defaults = {
             "lr": lr,
@@ -32,6 +36,8 @@ class _FunctionalSGD(object):
             "weight_decay": weight_decay,
         }
         self.nesterov = nesterov
+        self.maximize = maximize
+        self.foreach = foreach
         self.state = torch.jit.annotate(Dict[torch.Tensor, Dict[str, torch.Tensor]], {})
 
         if len(params) == 0 and not _allow_empty_param_list:
@@ -54,8 +60,12 @@ class _FunctionalSGD(object):
         params = [param]
         momentum_buffer_list: List[Optional[Tensor]] = []
         grads = []
+
+        has_sparse_grad = False
         if grad is not None:
             grads.append(grad)
+            if grad.is_sparse:
+                has_sparse_grad = True
             if param not in self.state:
                 self.state[param] = {}
             state = self.state[param]
@@ -74,6 +84,9 @@ class _FunctionalSGD(object):
                 lr=lr,
                 dampening=dampening,
                 nesterov=self.nesterov,
+                maximize=self.maximize,
+                has_sparse_grad=has_sparse_grad,
+                foreach=self.foreach,
             )
         # update momentum_buffer in state
         state = self.state[param]
@@ -98,10 +111,13 @@ class _FunctionalSGD(object):
                 + f"Gradients length: {len(gradients)}"
             )
 
+        has_sparse_grad = False
         for param, gradient in zip(params, gradients):
             if gradient is not None:
                 params_with_grad.append(param)
                 grads.append(gradient)
+                if gradient.is_sparse:
+                    has_sparse_grad = True
 
                 if param not in self.state:
                     self.state[param] = {}
@@ -120,7 +136,11 @@ class _FunctionalSGD(object):
                   momentum=momentum,
                   lr=lr,
                   dampening=dampening,
-                  nesterov=self.nesterov)
+                  nesterov=self.nesterov,
+                  maximize=self.maximize,
+                  has_sparse_grad=has_sparse_grad,
+                  foreach=self.foreach,
+                  )
 
         # update momentum_buffers in state
         for i, p in enumerate(params_with_grad):

@@ -1,6 +1,7 @@
+#include <ATen/ATen.h>
 #include <ATen/Config.h>
 #include <ATen/Utils.h>
-#include <ATen/core/interned_strings.h>
+#include <ATen/core/symbol.h>
 #include <ATen/native/layer_norm.h>
 #include <c10/core/ScalarType.h>
 #include <c10/util/Exception.h>
@@ -243,9 +244,15 @@ Operation createUnaryOp(
     auto a_it = at::native::itensor_from_mkldnn(a);
     auto mkldnn_raw_data = a_it.get_data_handle();
     auto a_options_with_strided = a.options().layout(c10::kStrided);
+
+    // tensor's physical size could be bigger than a logical one
+    // `a_it.get_desc().get_size()` returns the real physical size (in bytes)
+    // we use it to compute `nelem` for `aten` ops
+    auto nelem = static_cast<int64_t>(
+        a_it.get_desc().get_size() / elementSize(a.scalar_type()));
     // we also wrap `a` storage into an aten tensor
     auto in_aten =
-        at::from_blob(mkldnn_raw_data, {a.numel()}, a_options_with_strided);
+        at::from_blob(mkldnn_raw_data, {nelem}, a_options_with_strided);
 
     auto out_raw_data = mkldnn_raw_data;
     auto out = a;
@@ -262,12 +269,9 @@ Operation createUnaryOp(
       out_raw_data = at::native::itensor_from_mkldnn(out).get_data_handle();
     }
 
-    // tensor's physical size could be bigger than a logical one
-    // `a_it.get_desc().get_size()` returns the real physical size (in bytes)
-    // we use it to compute `nelem` for `aten` ops
     TORCH_INTERNAL_ASSERT(
         a_it.get_desc().get_size() % elementSize(a.scalar_type()) == 0);
-    auto nelem = a_it.get_desc().get_size() / elementSize(a.scalar_type());
+
     auto out_aten = at::from_blob(
         out_raw_data, {static_cast<int64_t>(nelem)}, a_options_with_strided);
     aten_op(out_aten, in_aten);
@@ -292,7 +296,7 @@ void MKLDNNLayerNormOp(Stack& stack, bool inplace) {
   TORCH_INTERNAL_ASSERT(weight_ival.isTensor());
   weight = weight_ival.toTensor();
 
-  auto shape = pop(stack).toIntVector();
+  auto shape = pop(stack).toDimVector();
   auto input = pop(stack).toTensor();
 
   at::Tensor dst, mean, rstd;
@@ -936,8 +940,7 @@ class MKLDNNSubgraphSlicer {
       return true;
     }
     // see [mkldnn perf strategy]
-    return frozenMkldnnCompatibleLinearNode(node) ||
-        frozenMkldnnCompatibleConvNode(node);
+    return frozenMkldnnCompatibleConvNode(node);
   }
 
  private:
@@ -988,6 +991,7 @@ class MKLDNNSubgraphSlicer {
       case aten::relu:
       case aten::relu6:
       case aten::gelu:
+      case aten::prelu:
       case aten::sigmoid:
       case aten::hardsigmoid:
       case aten::hardswish:

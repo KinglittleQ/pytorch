@@ -4,10 +4,9 @@
 #include <torch/csrc/jit/codegen/fuser/compiler.h>
 
 #include <ATen/ATen.h>
-#include <ATen/CUDAGeneratorImpl.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <ATen/cuda/nvrtc_stub/ATenNVRTC.h>
-#include <THC/THC.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/csrc/jit/resource_guard.h>
 
@@ -36,6 +35,10 @@ void codegenOutputQuery(
     int& major,
     int& minor,
     bool& compile_to_sass) {
+#ifdef USE_ROCM
+  AT_CUDA_NVRTC_CHECK(nvrtc().nvrtcVersion(&major, &minor));
+  compile_to_sass = false;
+#else
   using CudaVersion = std::pair<int, int>;
   CudaVersion nvrtc_version;
   AT_CUDA_NVRTC_CHECK(
@@ -76,6 +79,7 @@ void codegenOutputQuery(
     minor = dev_version.second;
     compile_to_sass = true;
   }
+#endif
 }
 
 // Compiles the specified kernel and stores the metadata required to run it

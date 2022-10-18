@@ -1,4 +1,5 @@
-#include <ATen/ATen.h>
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#include <ATen/core/Tensor.h>
 #include <ATen/Parallel.h>
 #include <torch/custom_class.h>
 #include <torch/library.h>
@@ -7,10 +8,17 @@
 #include <ATen/native/ao_sparse/quantized/cpu/packed_params.h>
 #include <c10/util/irange.h>
 
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/Functions.h>
+#else
+#include <ATen/ops/_empty_affine_quantized.h>
+#include <ATen/ops/empty.h>
+#endif
+
 namespace ao {
 namespace sparse {
 
-torch::class_<LinearPackedParamsBase> register_linear_params();
+int register_linear_params();
 
 #ifdef USE_FBGEMM
 

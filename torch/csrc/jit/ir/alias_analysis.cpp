@@ -1,11 +1,14 @@
 #include <torch/csrc/jit/ir/alias_analysis.h>
 
+#include <ATen/core/interned_strings.h>
+#include <c10/util/flat_hash_map.h>
 #include <c10/util/irange.h>
+#include <torch/csrc/jit/api/function_impl.h>
 #include <torch/csrc/jit/jit_log.h>
+#include <torch/csrc/jit/passes/inliner.h>
 #include <torch/csrc/jit/passes/utils/subgraph_utils.h>
 #include <torch/csrc/jit/runtime/operator.h>
 #include <torch/csrc/utils/memory.h>
-
 #include <fstream>
 
 namespace torch {
@@ -26,7 +29,7 @@ c10::MaybeOwned<TypePtr> toSingleType(const AliasTypeSet& mut_types) {
 class MutableTypePtrHelper {
  public:
   explicit MutableTypePtrHelper(
-      std::unordered_map<TypePtr, AliasTypeSet>* mutable_type_cache)
+      ska::flat_hash_map<TypePtr, AliasTypeSet>* mutable_type_cache)
       : mutable_type_cache_(mutable_type_cache) {}
 
   // Map any mutable type to a type such that all other types which the
@@ -140,12 +143,12 @@ class MutableTypePtrHelper {
         return c10::nullopt;
     }
   }
-  std::unordered_map<TypePtr, AliasTypeSet>* mutable_type_cache_;
+  ska::flat_hash_map<TypePtr, AliasTypeSet>* mutable_type_cache_;
 };
 
 bool isMutableTypeImpl(
     const TypePtr& type,
-    std::unordered_map<TypePtr, AliasTypeSet>* mutable_type_cache) {
+    ska::flat_hash_map<TypePtr, AliasTypeSet>* mutable_type_cache) {
   // Check common cases to avoid recursively constructing type in
   // `mapTypeToAliasTypeSetPtrImpl`
   auto kind = type->kind();
@@ -210,10 +213,10 @@ struct AliasDb::WriteRegistry {
 AliasDb::AliasDb(
     std::shared_ptr<Graph> graph,
     bool isFrozen,
-    bool enablePreciseTupleContainerAnalysis)
+    bool descendFunctionCalls)
     : graph_(std::move(graph)),
       isFrozen_(isFrozen),
-      enablePreciseTupleContainerAnalysis_(enablePreciseTupleContainerAnalysis),
+      descend_function_calls_(descendFunctionCalls),
       memoryDAGBuilder_(std::make_unique<MemoryDAGBuilder>()),
       writeRegistry_(std::make_unique<AliasDb::WriteRegistry>()) {
   analyze(graph_);
@@ -597,6 +600,11 @@ void AliasDb::analyzeImpl(Node* node) {
       for (const auto input : node->inputs()) {
         oss << input->type()->str() << ", ";
       }
+      oss << "\n\nCandidates:";
+      const auto& candidates = getAllOperatorsFor(node->kind());
+      for (const auto& candidate : candidates) {
+        oss << "\n\t" << candidate->schema();
+      }
       TORCH_INTERNAL_ASSERT(
           0,
           "We don't have an op for ",
@@ -615,6 +623,7 @@ void AliasDb::analyzeImpl(Node* node) {
       return analyzeLoop(node);
     case prim::FusionGroup:
     case prim::CudaFusionGroup:
+    case prim::oneDNNFusionGroup:
     case prim::FunctionalGraph:
     case prim::DifferentiableGraph:
     case prim::FallbackGraph:
@@ -640,6 +649,7 @@ void AliasDb::analyzeImpl(Node* node) {
     }
     // TODO: think more about TensorExpr alias correctness
     case prim::TensorExprGroup:
+    case prim::TensorExprDynamicGroup:
     case prim::MKLDNNGroup:
     case prim::ConstantMKLDNNTensor:
     case prim::StaticSubgraph:
@@ -651,6 +661,10 @@ void AliasDb::analyzeImpl(Node* node) {
     case prim::MMBatchSide:
     case prim::BroadcastSizes:
     case prim::ChunkSizes:
+    // this should never be seen outside of initial compilation
+    // but because of some dependencies with closure invoking alias
+    // db needs to be handled here
+    case prim::EmptyListLiteral:
     case prim::Closure:
     case prim::CreateObject:
     case prim::tolist:
@@ -702,7 +716,37 @@ void AliasDb::analyzeImpl(Node* node) {
       makePointerTo(node->output(), node->inputs().at(0));
       return;
     case prim::CallFunction:
-    case prim::CallMethod:
+    case prim::CallMethod: {
+      // TODO: this can be improved with summarizes of what the function does
+      // for now we assume the worst
+      if (!descend_function_calls_) {
+        return analyzeConservative(node);
+      }
+      auto g = tryToGraphFunction(node);
+      if (!g) {
+        return analyzeConservative(node);
+      }
+      // this is an unoptimized path - we copy the subgraph for each function
+      // call past the first - so we do not generally enable the recursive
+      // analysis. use cases for fine-grained alias analysis without inlining
+      // are very uncommon
+      auto graph = g->optimized_graph();
+      // alias analysis will use Value* as mappings for information,
+      // so for each analysis of a particular function call we need a new graph
+      // for all copies made, store them for duration of analysis so we do not
+      // run into lifetime issues with the graph
+      std::vector<std::shared_ptr<Graph>>& graphs =
+          function_call_copies_[graph.get()];
+      if (graphs.size() == 0) {
+        graphs.push_back(graph);
+        analyzeSubgraph(node, graph);
+      } else {
+        auto copied_graph = graph->copy();
+        graphs.push_back(copied_graph);
+        analyzeSubgraph(node, copied_graph);
+      }
+      return;
+    }
     case prim::Enter:
     case prim::Exit:
       // TODO: this can be improved with summarizes of what the function does
@@ -771,6 +815,7 @@ void AliasDb::analyzeImpl(Node* node) {
   for (const auto i : c10::irange(schema.arguments().size())) {
     const at::AliasInfo* formal = schema.arguments()[i].alias_info();
     const auto& actualValue = node->inputs().at(i);
+
     // Skip if there's no alias annotation
     if (!formal) {
       continue;
@@ -783,11 +828,17 @@ void AliasDb::analyzeImpl(Node* node) {
 
     // Do sanity checks on the alias annotation
     TORCH_INTERNAL_ASSERT(
-        formal->containedTypes().size() == 0,
+        formal->containedTypes().size() <= 1,
         "Composite types for alias analysis not yet supported");
     TORCH_INTERNAL_ASSERT(
         !formal->isWildcardBefore(),
         "Doesn't make sense for a input value to begin as a wildcard");
+    // This is a special case where we have alias info before [] but not after,
+    // such as `Tensor(a!)[]`
+    if (formal->containedTypes().size() == 1 && formal->beforeSets().empty()) {
+      // Use the first containedType in alias info.
+      formal = &(formal->containedTypes()[0]);
+    }
 
     const auto& formalAlias = formal->beforeSet();
 
@@ -834,10 +885,13 @@ void AliasDb::analyzeImpl(Node* node) {
     }
 
     TORCH_INTERNAL_ASSERT(
-        formal->containedTypes().size() == 0,
+        formal->containedTypes().size() <= 1,
         "Composite types for alias analysis not yet supported");
     TORCH_INTERNAL_ASSERT(formal->beforeSets() == formal->afterSets());
-
+    if (formal->containedTypes().size() == 1 && formal->beforeSets().empty()) {
+      // Use the first containedType in alias info.
+      formal = &(formal->containedTypes()[0]);
+    }
     if (formal->isWildcardBefore()) {
       TORCH_INTERNAL_ASSERT(
           formal->beforeSets().size() == 1,
@@ -847,25 +901,22 @@ void AliasDb::analyzeImpl(Node* node) {
       continue;
     }
 
+    bool inputs_has_alias = false;
     for (const auto& formalAlias : formal->beforeSets()) {
-      // If we encounter an alias annotation that wasn't in the inputs:
-      if (!formalToActual.count(formalAlias)) {
-        // If this alias is not seen elsewhere and is the only annotation on
-        // the output, it's equivalent to being fresh:
-        //   e.g. foo(Tensor(a) self) -> Tensor(b)
-        if (formal->beforeSets().size() == 1) {
-          giveFreshAlias(actual);
-        }
-        // Or it is the form of a|fresh, which we can ignore, taking the
-        // conservative assumption that the output must alias `a`, e.g
-        //   aten::cuda(Tensor(a) self) -> Tensor(a|fresh)
-
-        // Don't assign an alias set in that case.
-        continue;
+      if (formalToActual.count(formalAlias)) {
+        inputs_has_alias = true;
+        auto toAlias = formalToActual.at(formalAlias);
+        makePointerTo(actual, toAlias);
       }
-
-      auto toAlias = formalToActual.at(formalAlias);
-      makePointerTo(actual, toAlias);
+    }
+    // If all the alias annotation that we encounter weren't in the inputs:
+    //   e.g. foo(Tensor(a) self) -> Tensor(b)
+    //   or foo(Tensor(a) self) -> Tensor(b|c)
+    // Otherwise it is the form of a|fresh, which we can ignore, taking the
+    // conservative assumption that the output must alias `a`, e.g
+    //   aten::cuda(Tensor(a) self) -> Tensor(a|fresh)
+    if (!inputs_has_alias && formal->beforeSets().size()) {
+      giveFreshAlias(actual);
     }
 
     // Record writes
@@ -932,10 +983,14 @@ void AliasDb::analyzeGradOf(Node* node) {
   mapAliases(node->outputs(), grad_of_block->outputs());
 }
 
-void AliasDb::analyzeSubgraph(Node* node) {
-  const auto subgraph = node->g(attr::Subgraph).get();
+void AliasDb::analyzeSubgraph(Node* node, std::shared_ptr<Graph> subgraph) {
   const auto subgraphBlock = subgraph->block();
-  mapAliases(subgraphBlock->inputs(), node->inputs());
+  // CallFunction nodes have an extra first parameter
+  if (node->kind() == prim::CallFunction) {
+    mapAliases(subgraphBlock->inputs(), node->inputs().slice(1));
+  } else {
+    mapAliases(subgraphBlock->inputs(), node->inputs());
+  }
 
   analyze(subgraphBlock);
 
@@ -944,11 +999,15 @@ void AliasDb::analyzeSubgraph(Node* node) {
   // subgraph block.
   TORCH_INTERNAL_ASSERT(
       subgraphBlock->outputs().size() >= node->outputs().size());
-  for (const auto i : c10::irange(node->outputs().size())) {
+  for (size_t i = 0; i < node->outputs().size(); i++) {
     makePointerTo(node->outputs()[i], subgraphBlock->outputs()[i]);
   }
 }
 
+void AliasDb::analyzeSubgraph(Node* node) {
+  const auto subgraph = node->g(attr::Subgraph);
+  return analyzeSubgraph(node, subgraph);
+}
 // For nodes that generate a fresh value from nothing
 void AliasDb::analyzeCreator(Node* node) {
   for (Value* output : node->outputs()) {
@@ -1122,6 +1181,12 @@ bool AliasDb::functionalNonEscapingListUse(const Use& use) const {
   common ops where the output does not alias the list or the list elements
   */
 
+  // only used in output of graph - no further uses,
+  // so there will be no use of it where the contained element leaks
+  if (use.user->kind() == prim::Return) {
+    return use.user->owningBlock() == graph_->block();
+  }
+
   switch (use.user->kind()) {
     case aten::cat:
     case aten::broadcast_tensors:
@@ -1135,14 +1200,10 @@ bool AliasDb::functionalNonEscapingListUse(const Use& use) const {
   if (op && op->aliasAnalysisKind() == AliasAnalysisKind::PURE_FUNCTION) {
     return true;
   }
-
   return false;
 }
 
 bool AliasDb::functionalNonEscapingTupleUse(const Use& use) const {
-  if (!enablePreciseTupleContainerAnalysis_) {
-    return false;
-  }
   Node* n = use.user;
   size_t offset = use.offset;
   Value* container = n->inputs().at(offset);
@@ -1150,7 +1211,9 @@ bool AliasDb::functionalNonEscapingTupleUse(const Use& use) const {
     return false;
   }
   // TODO(T97387453): Cover more ops that do not let escape tuples' elements.
-  return use.user->kind() == prim::Return;
+  bool in_return_outputs = use.user->kind() == prim::Return;
+  bool not_in_nested_subgraph = use.user->owningBlock() == graph_->block();
+  return in_return_outputs && not_in_nested_subgraph;
 }
 
 // List or dict or tuple construct: create an aliasing element for the actual
@@ -1326,6 +1389,16 @@ bool AliasDb::mayContainAlias(
   return a_elems.size() == 0
       ? false
       : memoryDAG_->mayContainAlias(a_elems, getElements(b));
+}
+
+bool AliasDb::mayContainAlias(Value* a, const at::ArrayRef<Value*> b) const {
+  if (!isMutableTypeInternal(a)) {
+    return false;
+  }
+  auto b_elems = getElements(b);
+  return b_elems.size() == 0
+      ? false
+      : memoryDAG_->mayContainAlias(elementMap_.at(a), b_elems);
 }
 
 // Make each value in the `from` list point to its partner in the `to` list

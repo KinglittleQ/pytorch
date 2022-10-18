@@ -38,21 +38,27 @@ enum pytorch_qnnp_ukernel_type {
 };
 
 typedef struct {
-  const uint32_t* col_indices;
-  const uint32_t* row_values;
+  union {
+    const uint32_t* col_indices_w32;
+    const uint16_t* col_indices_w16;
+    const uint8_t* col_indices_w8;
+  };
+  union {
+    const uint32_t* row_values_w32;
+    const uint16_t* row_values_w16;
+    const uint8_t* row_values_w8;
+  };
   const uint8_t* values;
   uint32_t row_block_size;
   uint32_t col_block_size;
+  enum pytorch_qnnp_sparse_matrix_indices_dtype indices_dtype;
 } sparse_matrix_t;
 
 struct pytorch_qnnp_operator {
   size_t batch_size;
-  uint32_t input_padding_front;
-  uint32_t input_padding_back;
-  uint32_t input_padding_top;
-  uint32_t input_padding_right;
-  uint32_t input_padding_bottom;
-  uint32_t input_padding_left;
+  uint32_t input_padding_depth;
+  uint32_t input_padding_height;
+  uint32_t input_padding_width;
   uint32_t adjustment_height;
   uint32_t adjustment_width;
   uint32_t kernel_depth;
@@ -78,6 +84,10 @@ struct pytorch_qnnp_operator {
   const void* input;
   const void** indirection_buffer;
   void* a_sum;
+
+  size_t step_depth;
+  size_t step_height;
+  size_t step_width;
 
   size_t input2_pixel_stride;
   const void* input2;

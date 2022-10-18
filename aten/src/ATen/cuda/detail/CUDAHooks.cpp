@@ -1,6 +1,6 @@
 #include <ATen/cuda/detail/CUDAHooks.h>
 
-#include <ATen/CUDAGeneratorImpl.h>
+#include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <ATen/Context.h>
 #include <ATen/DeviceGuard.h>
 #include <ATen/DynamicLibrary.h>
@@ -15,8 +15,7 @@
 #include <ATen/native/cuda/CuFFTPlanCache.h>
 #include <c10/util/Exception.h>
 #include <c10/cuda/CUDACachingAllocator.h>
-
-#include <THC/THCGeneral.h>  // For THCState
+#include <c10/util/irange.h>
 
 #if AT_CUDNN_ENABLED()
 #include <ATen/cudnn/cudnn-wrapper.h>
@@ -54,23 +53,30 @@ void set_magma_init_fn(void (*fn)()) {
   magma_init_fn = fn;
 }
 
+// Sets the CUDA_MODULE_LOADING environment variable
+// if it's not set by the user.
+void maybe_set_cuda_module_loading(const std::string &def_value) {
+  auto value = std::getenv("CUDA_MODULE_LOADING");
+  if (!value) {
+#ifdef _WIN32
+    auto env_var = "CUDA_MODULE_LOADING=" + def_value;
+    _putenv(env_var.c_str());
+#else
+    setenv("CUDA_MODULE_LOADING", def_value.c_str(), 1);
+#endif
+  }
+}
+
 // NB: deleter is dynamic, because we need it to live in a separate
 // compilation unit (alt is to have another method in hooks, but
 // let's not if we don't need to!)
-std::unique_ptr<THCState, void (*)(THCState*)> CUDAHooks::initCUDA() const {
+void CUDAHooks::initCUDA() const {
   C10_LOG_API_USAGE_ONCE("aten.init.cuda");
-  // NOTE: THCState is now an empty struct but this pointer is passed
-  // to every THC function. So we can't remove it before the rest of THC.
-  auto thc_state = std::unique_ptr<THCState, void (*)(THCState*)>(
-      new THCState(),
-      [](THCState* p) {
-        delete p;
-      });
-
   // Force the update to enable unit testing. This code get executed before unit tests
   // have a chance to enable vitals.
   at::vitals::VitalsAPI.setVital("CUDA", "used", "true", /* force = */ true);
 
+  maybe_set_cuda_module_loading("LAZY");
   const auto num_devices = c10::cuda::device_count_ensure_non_zero();
   c10::cuda::CUDACachingAllocator::init(num_devices);
   at::cuda::detail::init_p2p_access_cache(num_devices);
@@ -79,8 +85,6 @@ std::unique_ptr<THCState, void (*)(THCState*)> CUDAHooks::initCUDA() const {
   TORCH_INTERNAL_ASSERT(magma_init_fn != nullptr, "Cannot initilaize magma, init routine not set");
   magma_init_fn();
 #endif
-
-  return thc_state;
 }
 
 const Generator& CUDAHooks::getDefaultCUDAGenerator(DeviceIndex device_index) const {
@@ -140,6 +144,22 @@ bool CUDAHooks::hasMAGMA() const {
 
 bool CUDAHooks::hasCuDNN() const {
   return AT_CUDNN_ENABLED();
+}
+
+bool CUDAHooks::hasCuSOLVER() const {
+#if defined(CUDART_VERSION) && defined(CUSOLVER_VERSION)
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool CUDAHooks::hasROCM() const {
+  // Currently, this is same as `compiledWithMIOpen`.
+  // But in future if there are ROCm builds without MIOpen,
+  // then `hasROCM` should return true while `compiledWithMIOpen`
+  // should return false
+  return AT_ROCM_ENABLED();
 }
 
 #if defined(USE_DIRECT_NVRTC)
@@ -212,7 +232,7 @@ c10::optional<int64_t> getDeviceIndexWithPrimaryContext() {
       return current_device_index;
     }
   }
-  for (int64_t device_index = 0; device_index < at::cuda::device_count(); device_index++) {
+  for (const auto device_index : c10::irange(at::cuda::device_count())) {
     if (device_index == current_device_index) continue;
     if (hasPrimaryContext(device_index)) {
       return device_index;
@@ -261,6 +281,20 @@ bool CUDAHooks::supportsDepthwiseConvolutionWithCuDNN() const {
 #endif
 }
 
+bool CUDAHooks::supportsBFloat16ConvolutionWithCuDNNv8() const {
+#if AT_CUDNN_ENABLED()
+  cudaDeviceProp* prop = at::cuda::getCurrentDeviceProperties();
+  // Check for Volta cores
+  if (prop->major >= 8) {
+    return true;
+  } else {
+    return false;
+  }
+#else
+  return false;
+#endif
+}
+
 long CUDAHooks::versionCuDNN() const {
 #if AT_CUDNN_ENABLED()
   return CUDNN_VERSION;
@@ -294,10 +328,22 @@ std::string CUDAHooks::showConfig() const {
   cudaRuntimeGetVersion(&runtimeVersion);
 
   auto printCudaStyleVersion = [&](int v) {
+#ifdef USE_ROCM
+    // HIP_VERSION value format was changed after ROCm v4.2 to include the patch number
+    if(v < 500) {
+      // If major=xx, minor=yy then format -> xxyy
+      oss << (v / 100) << "." << (v % 10);
+    }
+    else {
+      // If major=xx, minor=yy & patch=zzzzz then format -> xxyyzzzzz
+      oss << (v / 10000000) << "." << (v / 100000 % 100) << "." << (v % 100000);
+    }
+#else
     oss << (v / 1000) << "." << (v / 10 % 100);
     if (v % 10 != 0) {
       oss << "." << (v % 10);
     }
+#endif
   };
 
 #if !defined(USE_ROCM)

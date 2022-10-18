@@ -1,17 +1,19 @@
 #include <torch/csrc/jit/mobile/interpreter.h>
 
+#include <ATen/core/class_type.h>
+#include <ATen/core/dynamic_type.h>
 #include <ATen/core/function.h>
 #include <ATen/core/jit_type.h>
 #include <ATen/core/operator_name.h>
-#include <torch/csrc/jit/mobile/function.h>
-#include <torch/csrc/jit/runtime/jit_exception.h>
-#include <torch/csrc/jit/runtime/vararg_functions.h>
-
 #include <ATen/record_function.h>
 #include <c10/util/Exception.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/jit/backends/backend_exception.h>
+#include <torch/csrc/jit/mobile/function.h>
 #include <torch/csrc/jit/mobile/observer.h>
+#include <torch/csrc/jit/mobile/promoted_prim_ops.h>
+#include <torch/csrc/jit/runtime/jit_exception.h>
+#include <torch/csrc/jit/runtime/vararg_functions.h>
 
 namespace torch {
 namespace jit {
@@ -23,7 +25,7 @@ InterpreterState::InterpreterState(const Code& code) {
 }
 
 namespace {
-static thread_local DebugHandle exception_debug_handle_{-1};
+static thread_local std::vector<DebugHandle> exception_debug_handles_;
 void createObject(Stack& stack, const at::ClassTypePtr& type) {
   auto userObj = c10::ivalue::Object::create(
       c10::StrongTypePtr(type->compilation_unit(), type),
@@ -32,7 +34,7 @@ void createObject(Stack& stack, const at::ClassTypePtr& type) {
 }
 
 void isinstance(Stack& stack, at::ArrayRef<at::TypePtr> types) {
-  at::TypePtr ty = pop(stack).type();
+  at::TypePtr ty = pop(stack).type<c10::DynamicType>();
   for (const at::TypePtr& candidate : types) {
     if (ty->isSubtypeOf(*candidate)) {
       push(stack, true);
@@ -45,8 +47,8 @@ void isinstance(Stack& stack, at::ArrayRef<at::TypePtr> types) {
 
 using namespace at;
 
-int64_t getInterpretersExceptionDebugHandle() {
-  return exception_debug_handle_;
+const std::vector<DebugHandle>& getInterpretersExceptionDebugHandles() {
+  return exception_debug_handles_;
 }
 
 void InterpreterState::enterFrame(const Code& code) {
@@ -60,11 +62,23 @@ void InterpreterState::leaveFrame() {
   frames_.pop_back();
 }
 
-void InterpreterState::saveExceptionDebugHandle() {
-  const auto& frame = frames_.back();
-  if (auto handle = frame.getDebugHandle()) {
-    exception_debug_handle_ = *handle;
+void InterpreterState::saveExceptionDebugHandles() {
+  std::vector<DebugHandle> exception_debug_handles;
+  for (auto frame = frames_.crbegin(); frame != frames_.crend(); frame++) {
+    size_t pc = frame->getPC() - (frame != frames_.crbegin() ? 1 : 0);
+    if (auto handle = frame->getDebugHandle(pc)) {
+      exception_debug_handles.push_back(*handle);
+    } else {
+      exception_debug_handles.push_back(-1);
+    }
   }
+  exception_debug_handles_ = std::move(exception_debug_handles);
+}
+
+void InterpreterState::callFunction(torch::jit::Function& f, Stack& stack) {
+  bool newFrame =
+      f.call(stack, [&](const mobile::Code& code) { enterFrame(code); });
+  (frames_.rbegin() + (newFrame ? 1 : 0))->step();
 }
 
 bool InterpreterState::run(Stack& stack) {
@@ -82,12 +96,11 @@ bool InterpreterState::run(Stack& stack) {
         debug_handle = *handle;
       }
 
-      // std::cout << "RUNNING " << pc << " "
-      //           << code_->instructions_with_handles_[pc].instruction;
+      // std::cout << "RUNNING " << pc << " " << code.instructions_[pc];
       // if (inst.op == OP) {
-      //   std::cout << ", " << code_->op_names_[inst.X].name;
-      //   if (!code_->op_names_[inst.X].overload_name.empty()) {
-      //     std::cout << "." << code_->op_names_[inst.X].overload_name;
+      //   std::cout << ", " << code.op_names_[inst.X].name;
+      //   if (!code.op_names_[inst.X].overload_name.empty()) {
+      //     std::cout << "." << code.op_names_[inst.X].overload_name;
       //   }
       // }
       // std::cout << std::endl;
@@ -97,6 +110,10 @@ bool InterpreterState::run(Stack& stack) {
       // Check with iliacher if has been done.
       // Plus this is not safe as if you throw exception record function will be
       // left enabled. That is a TODO
+      // NOTE: this recordFunction logic takes up ~2-3% of cpu cycles in some
+      // workflows. do we need it and/or can we opt-out of
+      // isRecordFunctionEnabled with a macro? if we delete it, things appear to
+      // work just fine.
       bool prev_value = isRecordFunctionEnabled();
       if (!prev_value) {
         // enable only for the RecordFunction
@@ -125,9 +142,8 @@ bool InterpreterState::run(Stack& stack) {
           frame.step();
         } break;
         case CALL: {
-          auto& function = frame.getCode().functions_.at(inst.X);
-          frame.step();
-          enterFrame(*function->get_code());
+          auto& function = *frame.getCode().functions_.at(inst.X);
+          callFunction(function, stack);
         } break;
         case INTERFACE_CALL: {
           torch::jit::Function& method =
@@ -137,8 +153,7 @@ bool InterpreterState::run(Stack& stack) {
                   ->getMethod(code.constants_[inst.X].toStringRef());
           RECORD_EDGE_SCOPE_WITH_DEBUG_HANDLE_AND_INPUTS(
               method.name(), debug_handle, stack);
-          method.run(stack);
-          frame.step();
+          callFunction(method, stack);
         } break;
         case LOAD:
           stack.emplace_back(reg(inst.X));
@@ -222,8 +237,7 @@ bool InterpreterState::run(Stack& stack) {
           }
           return false;
         case LIST_CONSTRUCT: {
-          const auto& type = code.types_[inst.X]->expectRef<at::ListType>();
-          listConstruct(stack, type, inst.N);
+          listConstruct(stack, *code.types_.at(inst.X), inst.N);
           frame.step();
         } break;
         case LIST_UNPACK: {
@@ -238,24 +252,77 @@ bool InterpreterState::run(Stack& stack) {
           tupleSlice(stack, inst.X, inst.X + inst.N);
           frame.step();
         } break;
+        case TUPLE_INDEX: {
+          tupleIndex(stack);
+          frame.step();
+        } break;
+        case RAISE_EXCEPTION: {
+          raiseExceptionWithMessage(stack);
+          frame.step();
+        } break;
+        case __IS__: {
+          is(stack);
+          frame.step();
+        } break;
+        case UN_INITIALIZED: {
+          unInitialized(stack);
+          frame.step();
+        } break;
+        case __ISNOT__: {
+          isNot(stack);
+          frame.step();
+        } break;
+        case FORMAT: {
+          format(stack, inst.X);
+          frame.step();
+        } break;
+        case DEVICE: {
+          device(stack);
+          frame.step();
+        } break;
+        case DTYPE: {
+          dtype(stack);
+          frame.step();
+        } break;
+        case DIM: {
+          dim(stack);
+          frame.step();
+        } break;
+        case __NOT__: {
+          _not(stack);
+          frame.step();
+        } break;
+        case DICT_INDEX: {
+          dictIndex(stack);
+          frame.step();
+        } break;
+        case TO_LIST: {
+          toList(stack);
+          frame.step();
+        } break;
+        case NUM_TO_TENSOR: {
+          numToTensorScalar(stack);
+          frame.step();
+        } break;
+        case IS_CUDA: {
+          isCuda(stack);
+          frame.step();
+        } break;
         case DICT_CONSTRUCT: {
-          const auto& type = code.types_[inst.X]->expectRef<at::DictType>();
-          dictConstruct(stack, type, inst.N);
+          dictConstruct(stack, *code.types_.at(inst.X), inst.N);
           frame.step();
         } break;
         case NAMED_TUPLE_CONSTRUCT: {
-          namedTupleConstruct(
-              stack, code.types_[inst.X]->expect<at::TupleType>(), inst.N);
+          namedTupleConstruct(stack, code.types_.at(inst.X), inst.N);
           frame.step();
         } break;
         case CREATE_OBJECT: {
-          auto type = code.types_[inst.X]->expect<c10::ClassType>();
+          auto type = code.types_.at(inst.X)->expect<c10::ClassType>();
           createObject(stack, type);
           frame.step();
         } break;
         case ISINSTANCE: {
-          at::ArrayRef<TypePtr> types(
-              &(code.types_[inst.X]), &(code.types_[inst.X + inst.N]));
+          at::ArrayRef<TypePtr> types(&code.types_.at(inst.X), inst.N);
           isinstance(stack, types);
           frame.step();
         } break;
@@ -280,15 +347,15 @@ bool InterpreterState::run(Stack& stack) {
       }
       // This exception must be caught first as it derived from c10::Error
     } catch (c10::BackendRuntimeException& e) {
-      saveExceptionDebugHandle();
+      saveExceptionDebugHandles();
       TORCH_RETHROW(e);
     } catch (c10::Error& error) {
       // Reason for catching and rethrowing the error is so that we can
       // set the exception pc that is queried later
-      saveExceptionDebugHandle();
+      saveExceptionDebugHandles();
       TORCH_RETHROW(error);
     } catch (...) {
-      saveExceptionDebugHandle();
+      saveExceptionDebugHandles();
       throw;
     }
     //  for (auto val : stack) {

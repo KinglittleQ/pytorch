@@ -14,7 +14,8 @@ from ._six import string_classes as _string_classes
 from torch._sources import get_source_lines_and_file
 from torch.types import Storage
 from torch.storage import _get_dtype_from_pickle_storage_type
-from typing import Any, BinaryIO, cast, Dict, Optional, Type, Tuple, Union, IO
+from typing import Any, BinaryIO, Callable, cast, Dict, Optional, Type, Tuple, Union, IO
+from typing_extensions import TypeAlias
 import copyreg
 import pickle
 import pathlib
@@ -28,6 +29,24 @@ SHORT_SIZE = struct.Struct('=h').size
 MAGIC_NUMBER = 0x1950a86a20f9469cfc6c
 PROTOCOL_VERSION = 1001
 STORAGE_KEY_SEPARATOR = ','
+
+FILE_LIKE: TypeAlias = Union[str, os.PathLike, BinaryIO, IO[bytes]]
+MAP_LOCATION: TypeAlias = Optional[Union[Callable[[torch.Tensor, str], torch.Tensor], torch.device, str, Dict[str, str]]]
+
+__all__ = [
+    'SourceChangeWarning',
+    'mkdtemp',
+    'register_package',
+    'check_module_version_greater_or_equal',
+    'validate_cuda_device',
+    'location_tag',
+    'default_restore_location',
+    'normalize_storage_type',
+    'storage_to_tensor_type',
+    'save',
+    'load',
+    'StorageType',
+]
 
 class SourceChangeWarning(Warning):
     pass
@@ -56,7 +75,7 @@ def _is_zipfile(f) -> bool:
     start = f.tell()
 
     byte = f.read(1)
-    while byte != "":
+    while byte != b"":
         read_bytes.append(byte)
         if len(read_bytes) == 4:
             break
@@ -115,13 +134,23 @@ def check_module_version_greater_or_equal(module, req_version_tuple, error_if_ma
 
 
 def _cpu_tag(obj):
-    if type(obj).__module__ == 'torch':
+    if obj.device.type == 'cpu':
         return 'cpu'
 
 
 def _cuda_tag(obj):
-    if type(obj).__module__ == 'torch.cuda':
-        return 'cuda:' + str(obj.get_device())
+    if obj.device.type == 'cuda':
+        return 'cuda:' + str(obj.device.index)
+
+
+def _mps_tag(obj):
+    if obj.device.type == 'mps':
+        return 'mps'
+
+
+def _meta_tag(obj):
+    if obj.device.type == 'meta':
+        return 'meta'
 
 
 def _cpu_deserialize(obj, location):
@@ -151,18 +180,27 @@ def _cuda_deserialize(obj, location):
     if location.startswith('cuda'):
         device = validate_cuda_device(location)
         if getattr(obj, "_torch_load_uninitialized", False):
-            storage_type = getattr(torch.cuda, type(obj).__name__)
             with torch.cuda.device(device):
-                return storage_type(obj.nbytes())
+                return torch.UntypedStorage(obj.nbytes(), device=torch.device(location))
         else:
             return obj.cuda(device)
+
+def _mps_deserialize(obj, location):
+    if location == 'mps':
+        return obj.mps()
+
+def _meta_deserialize(obj, location):
+    if location == 'meta':
+        return torch.UntypedStorage(obj.nbytes(), device='meta')
 
 
 register_package(10, _cpu_tag, _cpu_deserialize)
 register_package(20, _cuda_tag, _cuda_deserialize)
+register_package(21, _mps_tag, _mps_deserialize)
+register_package(22, _meta_tag, _meta_deserialize)
 
 
-def location_tag(storage: Union[Storage, torch.storage.TypedStorage]):
+def location_tag(storage: Union[Storage, torch.storage.TypedStorage, torch.UntypedStorage]):
     for _, tagger, _ in _package_registry:
         location = tagger(storage)
         if location:
@@ -331,8 +369,13 @@ def _check_dill_version(pickle_module) -> None:
                 pickle_module.__version__
             ))
 
-def save(obj, f: Union[str, os.PathLike, BinaryIO, IO[bytes]],
-         pickle_module=pickle, pickle_protocol=DEFAULT_PROTOCOL, _use_new_zipfile_serialization=True) -> None:
+def save(
+    obj: object,
+    f: FILE_LIKE,
+    pickle_module: Any = pickle,
+    pickle_protocol: int = DEFAULT_PROTOCOL,
+    _use_new_zipfile_serialization: bool = True
+) -> None:
     # Reference: https://github.com/pytorch/pytorch/issues/54354
     # The first line of this docstring overrides the one Sphinx generates for the
     # documentation. We need it so that Sphinx doesn't leak `pickle`s path from
@@ -374,18 +417,25 @@ def save(obj, f: Union[str, os.PathLike, BinaryIO, IO[bytes]],
     """
     _check_dill_version(pickle_module)
 
-    with _open_file_like(f, 'wb') as opened_file:
-        if _use_new_zipfile_serialization:
-            with _open_zipfile_writer(opened_file) as opened_zipfile:
-                _save(obj, opened_zipfile, pickle_module, pickle_protocol)
-                return
-        _legacy_save(obj, opened_file, pickle_module, pickle_protocol)
+    if _use_new_zipfile_serialization:
+        with _open_zipfile_writer(f) as opened_zipfile:
+            _save(obj, opened_zipfile, pickle_module, pickle_protocol)
+            return
+    else:
+        with _open_file_like(f, 'wb') as opened_file:
+            _legacy_save(obj, opened_file, pickle_module, pickle_protocol)
 
 
 def _legacy_save(obj, f, pickle_module, pickle_protocol) -> None:
     import torch.nn as nn
     serialized_container_types = {}
     serialized_storages = {}
+
+    # Since loading storages that view the same data with different dtypes is
+    # not supported, we need to keep track of the dtype associated with each
+    # storage data_ptr and throw an error if the dtype is ever different.
+    # TODO: This feature could be added in the future
+    storage_dtypes: Dict[int, torch.dtype] = {}
 
     def persistent_id(obj: Any) -> Optional[Tuple]:
         # FIXME: the docs say that persistent_id should only return a string
@@ -408,23 +458,40 @@ def _legacy_save(obj, f, pickle_module, pickle_protocol) -> None:
             return ('module', obj, source_file, source)
 
         if isinstance(obj, torch.storage.TypedStorage) or torch.is_storage(obj):
+            storage: torch.UntypedStorage
+
             if isinstance(obj, torch.storage.TypedStorage):
                 # TODO: Once we decide to break serialization FC, this case
                 # can be deleted
                 storage = obj._storage
+                storage_dtype = obj.dtype
                 storage_type_str = obj.pickle_storage_type()
                 storage_type = getattr(torch, storage_type_str)
                 dtype = obj.dtype
                 storage_numel = obj.size()
 
-            else:
+            elif isinstance(obj, torch.UntypedStorage):
                 storage = obj
+                storage_dtype = torch.uint8
                 storage_type = normalize_storage_type(type(obj))
                 dtype = torch.uint8
-                storage_numel = cast(Storage, storage).nbytes()
+                storage_numel = storage.nbytes()
+            else:
+                raise TypeError(f'type not recognized: {type(obj)}')
+
+            # If storage is allocated, ensure that any other saved storages
+            # pointing to the same data all have the same dtype. If storage is
+            # not allocated, don't perform this check
+            if storage.data_ptr() != 0:
+                if storage.data_ptr() in storage_dtypes:
+                    if storage_dtype != storage_dtypes[storage.data_ptr()]:
+                        raise RuntimeError(
+                            'Cannot save multiple tensors or storages that '
+                            'view the same data as different types')
+                else:
+                    storage_dtypes[storage.data_ptr()] = storage_dtype
 
             view_metadata: Optional[Tuple[str, int, int]]
-            storage = cast(Storage, storage)
 
             # Offset is always 0, but we keep it for backwards compatibility
             # with the old serialization format (which supported storage views)
@@ -507,6 +574,12 @@ def _save(obj, zip_file, pickle_module, pickle_protocol):
     serialized_storages = {}
     id_map: Dict[int, str] = {}
 
+    # Since loading storages that view the same data with different dtypes is
+    # not supported, we need to keep track of the dtype associated with each
+    # storage data_ptr and throw an error if the dtype is ever different.
+    # TODO: This feature could be added in the future
+    storage_dtypes: Dict[int, torch.dtype] = {}
+
     def persistent_id(obj):
         # FIXME: the docs say that persistent_id should only return a string
         # but torch store returns tuples. This works only in the binary protocol
@@ -519,16 +592,29 @@ def _save(obj, zip_file, pickle_module, pickle_protocol):
                 # TODO: Once we decide to break serialization FC, this case
                 # can be deleted
                 storage = obj._storage
+                storage_dtype = obj.dtype
                 storage_type_str = obj.pickle_storage_type()
                 storage_type = getattr(torch, storage_type_str)
                 storage_numel = obj.size()
 
             else:
                 storage = obj
+                storage_dtype = torch.uint8
                 storage_type = normalize_storage_type(type(obj))
                 storage_numel = storage.nbytes()
 
-            storage = cast(Storage, storage)
+            # If storage is allocated, ensure that any other saved storages
+            # pointing to the same data all have the same dtype. If storage is
+            # not allocated, don't perform this check
+            if storage.data_ptr() != 0:
+                if storage.data_ptr() in storage_dtypes:
+                    if storage_dtype != storage_dtypes[storage.data_ptr()]:
+                        raise RuntimeError(
+                            'Cannot save multiple tensors or storages that '
+                            'view the same data as different types')
+                else:
+                    storage_dtypes[storage.data_ptr()] = storage_dtype
+
             storage_key = id_map.setdefault(storage._cdata, str(len(id_map)))
             location = location_tag(storage)
             serialized_storages[storage_key] = storage
@@ -563,7 +649,12 @@ def _save(obj, zip_file, pickle_module, pickle_protocol):
         zip_file.write_record(name, storage.data_ptr(), num_bytes)
 
 
-def load(f, map_location=None, pickle_module=pickle, **pickle_load_args):
+def load(
+    f: FILE_LIKE,
+    map_location: MAP_LOCATION = None,
+    pickle_module: Any = pickle,
+    **pickle_load_args: Any
+) -> Any:
     # Reference: https://github.com/pytorch/pytorch/issues/54354
     # The first line of this docstring overrides the one Sphinx generates for the
     # documentation. We need it so that Sphinx doesn't leak `pickle`s path from
@@ -634,6 +725,7 @@ def load(f, map_location=None, pickle_module=pickle, **pickle_load_args):
         as byte arrays which can be decoded later with ``byte_array.decode(...)``.
 
     Example:
+        >>> # xdoctest: +SKIP("undefined filepaths")
         >>> torch.load('tensors.pt')
         # Load all tensors onto the CPU
         >>> torch.load('tensors.pt', map_location=torch.device('cpu'))
@@ -667,7 +759,7 @@ def load(f, map_location=None, pickle_module=pickle, **pickle_load_args):
                                   " dispatching to 'torch.jit.load' (call 'torch.jit.load' directly to"
                                   " silence this warning)", UserWarning)
                     opened_file.seek(orig_position)
-                    return torch.jit.load(opened_file)
+                    return torch.jit.load(opened_file, map_location=map_location)
                 return _load(opened_zipfile, map_location, pickle_module, **pickle_load_args)
         return _legacy_load(opened_file, map_location, pickle_module, **pickle_load_args)
 
@@ -953,7 +1045,7 @@ def _load(zip_file, map_location, pickle_module, pickle_file='data.pkl', **pickl
     def load_tensor(dtype, numel, key, location):
         name = f'data/{key}'
 
-        storage = zip_file.get_storage_from_record(name, numel, torch.UntypedStorage).storage()._untyped()
+        storage = zip_file.get_storage_from_record(name, numel, torch.UntypedStorage).storage().untyped()
         # TODO: Once we decide to break serialization FC, we can
         # stop wrapping with TypedStorage
         loaded_storages[key] = torch.storage.TypedStorage(
@@ -968,7 +1060,10 @@ def _load(zip_file, map_location, pickle_module, pickle_file='data.pkl', **pickl
         assert typename == 'storage', \
             f"Unknown typename for persistent_load, expected 'storage' but got '{typename}'"
         storage_type, key, location, numel = data
-        dtype = storage_type.dtype
+        if storage_type is torch.UntypedStorage:
+            dtype = torch.uint8
+        else:
+            dtype = storage_type.dtype
 
         if key not in loaded_storages:
             nbytes = numel * torch._utils._element_size(dtype)

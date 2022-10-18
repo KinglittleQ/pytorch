@@ -1,9 +1,22 @@
-#include <ATen/ATen.h>
-#include <ATen/NativeFunctions.h>
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#include <ATen/core/Tensor.h>
 #include <ATen/Config.h>
 #include <ATen/native/mkldnn/MKLDNNCommon.h>
 #include <ATen/native/mkldnn/Utils.h>
 #include <ATen/native/utils/ParamUtils.h>
+
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/Functions.h>
+#include <ATen/NativeFunctions.h>
+#else
+#include <ATen/ops/_to_dense_native.h>
+#include <ATen/ops/empty.h>
+#include <ATen/ops/empty_native.h>
+#include <ATen/ops/mkldnn_reorder_conv2d_weight_native.h>
+#include <ATen/ops/mkldnn_reorder_conv3d_weight_native.h>
+#include <ATen/ops/to_mkldnn_native.h>
+#endif
+
 
 namespace at { namespace native {
 
@@ -30,7 +43,7 @@ Tensor mkldnn_to_dense(const Tensor& mkldnn_tensor, c10::optional<ScalarType> dt
       : stensor.to_public(cpu_tensor.template data_ptr<BFloat16>(),
                          ideep::tensor::data_type::bf16);
   cpu_tensor.as_strided_(dims, pub_tensor.get_strides());
-  return cpu_tensor;
+  return cpu_tensor.contiguous();
 }
 
 Tensor dense_to_mkldnn(const Tensor& cpu_tensor, c10::optional<ScalarType> dtype) {
@@ -43,7 +56,7 @@ Tensor dense_to_mkldnn(const Tensor& cpu_tensor, c10::optional<ScalarType> dtype
              "dense_to_mkldnn expects float or bfloat16 tensor input");
   TORCH_CHECK(cpu_tensor.dim() <= 5,
              "Can't convert cpu tensor with the number of dimensions > 5");
-  // TODO: consider to convert non-contiguous tensor to `ideep::tensor` directly.
+  // NOTE: forbid direct convert from non-contiguous (or channels last) to `ideep::tensor`.
   auto cpu_tensor_cont = cpu_tensor.contiguous();
   auto data_type = dtype.has_value() ? dtype.value() : cpu_tensor.scalar_type();
   TORCH_CHECK(data_type == ScalarType::Float || data_type == ScalarType::BFloat16,

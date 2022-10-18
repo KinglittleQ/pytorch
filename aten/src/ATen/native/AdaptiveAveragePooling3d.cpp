@@ -1,21 +1,35 @@
-#include <ATen/ATen.h>
-#include <ATen/NativeFunctions.h>
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#include <ATen/core/Tensor.h>
+#include <ATen/Dispatch.h>
 #include <ATen/Parallel.h>
 #include <c10/util/irange.h>
+
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/Functions.h>
+#include <ATen/NativeFunctions.h>
+#else
+#include <ATen/ops/_adaptive_avg_pool3d.h>
+#include <ATen/ops/_adaptive_avg_pool3d_backward_native.h>
+#include <ATen/ops/_adaptive_avg_pool3d_native.h>
+#include <ATen/ops/adaptive_avg_pool3d_backward_native.h>
+#include <ATen/ops/adaptive_avg_pool3d_native.h>
+#include <ATen/ops/empty.h>
+#include <ATen/ops/zeros_like.h>
+#endif
 
 namespace at {
 namespace native {
 
 namespace {
 
-inline int start_index(int a, int b, int c) {
+inline int64_t start_index(int64_t a, int64_t b, int64_t c) {
   // NOLINTNEXTLINE(cppcoreguidelines-narrowing-conversions,bugprone-narrowing-conversions)
-  return (int)std::floor((float)(a * c) / b);
+  return (a / b) * c + ((a % b) * c) / b;
 }
 
-inline int end_index(int a, int b, int c) {
+inline int64_t end_index(int64_t a, int64_t b, int64_t c) {
   // NOLINTNEXTLINE(cppcoreguidelines-narrowing-conversions,bugprone-narrowing-conversions)
-  return (int)std::ceil((float)((a + 1) * c) / b);
+  return 1 + ((a + 1) * c - 1) / b;
 }
 
 template <typename scalar_t>
@@ -98,7 +112,7 @@ void adaptive_avg_pool3d_out_cpu_template(
 
   TORCH_CHECK(
       (input.ndimension() == 4 || input.ndimension() == 5),
-      "adaptive_avg_pool3d(): Expected 3D or 4D tensor, but got ",
+      "adaptive_avg_pool3d(): Expected 4D or 5D tensor, but got ",
       input.sizes());
   TORCH_CHECK(input.dtype() == output.dtype(),
       "expected dtype ", input.dtype(), " for `output` but got dtype ", output.dtype());
@@ -299,10 +313,14 @@ Tensor adaptive_avg_pool3d_cpu(Tensor const& input, IntArrayRef output_size) {
   return output;
 }
 
-Tensor adaptive_avg_pool3d(at::Tensor const& input, IntArrayRef output_size) {
+Tensor adaptive_avg_pool3d(Tensor const& input, IntArrayRef output_size) {
   TORCH_CHECK(output_size.size() == 3, "adaptive_avg_pool3d: output_size must be 3");
+  TORCH_CHECK(
+        (output_size[0] >= 0 && output_size[1] >= 0 && output_size[2] >= 0),
+        "adaptive_avg_pool2d: elements of output_size must be greater than or equal to 0 ",
+        "but received {", output_size[0], ", ", output_size[1], ",", output_size[2], "}");
 
-  if (output_size[0] == 1 && output_size[1] == 1 && output_size[2] == 1) {
+  if (output_size[0] == 1 && output_size[1] == 1 && output_size[2] == 1 && !input.is_xpu()) {
     // in this case, adaptive pooling is just computing mean over hw
     // dimensions, which can be done more efficiently
     Tensor out = input.mean({-1, -2, -3}, /* keepdim = */ true);

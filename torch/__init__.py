@@ -14,7 +14,7 @@ import sys
 import platform
 import textwrap
 import ctypes
-import warnings
+import inspect
 if sys.version_info < (3,):
     raise Exception("Python 2 has reached end-of-life and is no longer supported by PyTorch.")
 
@@ -29,7 +29,8 @@ else:
 
 from ._six import string_classes as _string_classes
 
-from typing import Set, Type, TYPE_CHECKING
+from typing import Set, Type, TYPE_CHECKING, Union, Callable, Any
+import builtins
 
 __all__ = [
     'typename', 'is_tensor', 'is_storage', 'set_default_tensor_type',
@@ -38,10 +39,14 @@ __all__ = [
     'no_grad', 'enable_grad', 'rand', 'randn', 'inference_mode',
     'DoubleStorage', 'FloatStorage', 'LongStorage', 'IntStorage',
     'ShortStorage', 'CharStorage', 'ByteStorage', 'BoolStorage',
+    'TypedStorage', 'UntypedStorage',
     'DoubleTensor', 'FloatTensor', 'LongTensor', 'IntTensor',
     'ShortTensor', 'CharTensor', 'ByteTensor', 'BoolTensor', 'Tensor',
     'lobpcg', 'use_deterministic_algorithms',
     'are_deterministic_algorithms_enabled',
+    'is_deterministic_algorithms_warn_only_enabled',
+    'set_deterministic_debug_mode', 'get_deterministic_debug_mode',
+    'set_float32_matmul_precision', 'get_float32_matmul_precision',
     'set_warn_always', 'is_warn_always_enabled',
 ]
 
@@ -166,20 +171,11 @@ if (USE_RTLD_GLOBAL_WITH_LIBTORCH or os.getenv('TORCH_USE_RTLD_GLOBAL')) and \
     # you load consistently use the same libstdc++, or you may have
     # mysterious segfaults.
     #
-    import os as _dl_flags
-    if not hasattr(_dl_flags, 'RTLD_GLOBAL') or not hasattr(_dl_flags, 'RTLD_LAZY'):
-        try:
-            # next try if DLFCN exists
-            import DLFCN as _dl_flags  # type: ignore[import, no-redef]
-        except ImportError:
-            # as a last attempt, use compile-time constants
-            import torch._dl as _dl_flags  # type: ignore[import, no-redef]
     old_flags = sys.getdlopenflags()
-    sys.setdlopenflags(_dl_flags.RTLD_GLOBAL | _dl_flags.RTLD_LAZY)
+    sys.setdlopenflags(os.RTLD_GLOBAL | os.RTLD_LAZY)
     from torch._C import *  # noqa: F403
     sys.setdlopenflags(old_flags)
     del old_flags
-    del _dl_flags
 
 else:
     # Easy way.  You want this most of the time, because it will prevent
@@ -224,10 +220,15 @@ except ImportError:
             ''').strip()) from None
     raise  # If __file__ is not None the cause is unknown, so just re-raise.
 
-
-__all__ += [name for name in dir(_C)
-            if name[0] != '_' and
-            not name.endswith('Base')]
+for name in dir(_C):
+    if name[0] != '_' and not name.endswith('Base'):
+        __all__.append(name)
+        obj = getattr(_C, name)
+        if (isinstance(obj, Callable) or inspect.isclass(obj)):  # type: ignore[arg-type]
+            if (obj.__module__ != 'torch'):
+                # TODO: fix their module from C++ side
+                if name not in ['DisableTorchFunction', 'Generator']:
+                    obj.__module__ = 'torch'
 
 if not TYPE_CHECKING:
     # issue 38137 and python issue 43367. Submodules of a C extension are
@@ -308,6 +309,7 @@ def set_default_tensor_type(t):
 
     Example::
 
+        >>> # xdoctest: +SKIP("Other tests may have changed the default type. Can we reset it?")
         >>> torch.tensor([1.2, 3]).dtype    # initial default for floating point is torch.float32
         torch.float32
         >>> torch.set_default_tensor_type(torch.DoubleTensor)
@@ -344,6 +346,7 @@ def set_default_dtype(d):
                                   Either torch.float32 or torch.float64.
 
     Example:
+        >>> # xdoctest: +SKIP("Other tests may have changed the default type. Can we reset it?")
         >>> # initial default for floating point is torch.float32
         >>> # Python floats are interpreted as float32
         >>> torch.tensor([1.2, 3]).dtype
@@ -373,6 +376,12 @@ def use_deterministic_algorithms(mode, *, warn_only=False):
     and if only nondeterministic algorithms are available they will throw a
     :class:`RuntimeError` when called.
 
+    .. note:: This setting alone is not always enough to make an application
+        reproducible. Refer to :ref:`reproducibility` for more information.
+
+    .. note:: :func:`torch.set_deterministic_debug_mode` offers an alternative
+        interface for this feature.
+
     The following normally-nondeterministic operations will act
     deterministically when ``mode=True``:
 
@@ -390,10 +399,8 @@ def use_deterministic_algorithms(mode, *, warn_only=False):
           tensor
         * :func:`torch.Tensor.put_` with ``accumulate=True`` when called on a CPU
           tensor
-        * :func:`torch.Tensor.scatter_add_` when ``input`` dimension is one and called
-          on a CUDA tensor
-        * :func:`torch.gather` when ``input`` dimension is one and called
-          on a CUDA tensor that requires grad
+        * :func:`torch.Tensor.scatter_add_` when called on a CUDA tensor
+        * :func:`torch.gather` when called on a CUDA tensor that requires grad
         * :func:`torch.index_add` when called on CUDA tensor
         * :func:`torch.index_select` when attempting to differentiate a CUDA tensor
         * :func:`torch.repeat_interleave` when attempting to differentiate a CUDA tensor
@@ -409,6 +416,9 @@ def use_deterministic_algorithms(mode, *, warn_only=False):
         * :class:`torch.nn.AdaptiveMaxPool2d` when attempting to differentiate a CUDA tensor
         * :class:`torch.nn.FractionalMaxPool2d` when attempting to differentiate a CUDA tensor
         * :class:`torch.nn.FractionalMaxPool3d` when attempting to differentiate a CUDA tensor
+        * :class:`torch.nn.MaxUnpool1d`
+        * :class:`torch.nn.MaxUnpool2d`
+        * :class:`torch.nn.MaxUnpool3d`
         * :func:`torch.nn.functional.interpolate` when attempting to differentiate a CUDA tensor
           and one of the following modes is used:
 
@@ -427,10 +437,6 @@ def use_deterministic_algorithms(mode, *, warn_only=False):
         * :class:`torch.nn.CTCLoss` when attempting to differentiate a CUDA tensor
         * :class:`torch.nn.EmbeddingBag` when attempting to differentiate a CUDA tensor when
           ``mode='max'``
-        * :func:`torch.Tensor.scatter_add_` when ``input`` dimension is larger than one
-          and called on a CUDA tensor
-        * :func:`torch.gather` when ``input`` dimension is larger than one
-          and called on a CUDA tensor that requires grad
         * :func:`torch.Tensor.put_` when ``accumulate=False``
         * :func:`torch.Tensor.put_` when ``accumulate=True`` and called on a CUDA tensor
         * :func:`torch.histc` when called on a CUDA tensor
@@ -438,6 +444,7 @@ def use_deterministic_algorithms(mode, *, warn_only=False):
         * :func:`torch.kthvalue` with called on a CUDA tensor
         * :func:`torch.median` with indices output when called on a CUDA tensor
         * :func:`torch.nn.functional.grid_sample` when attempting to differentiate a CUDA tensor
+        * :func:`torch.cumsum` when called on a CUDA tensor when dtype is floating point or complex
 
     A handful of CUDA operations are nondeterministic if the CUDA version is
     10.2 or greater, unless the environment variable ``CUBLAS_WORKSPACE_CONFIG=:4096:8``
@@ -476,14 +483,15 @@ def use_deterministic_algorithms(mode, *, warn_only=False):
         >>> torch.use_deterministic_algorithms(True)
 
         # Forward mode nondeterministic error
-        >>> torch.randn(10).index_copy(0, torch.tensor([0]), torch.randn(1))
+        >>> # xdoctest: +SKIP
+        >>> torch.randn(10, device='cuda').kthvalue(0)
         ...
-        RuntimeError: index_copy does not have a deterministic implementation...
+        RuntimeError: kthvalue CUDA does not have a deterministic implementation...
 
         # Backward mode nondeterministic error
-        >>> torch.randn(10, requires_grad=True, device='cuda').index_select(0, torch.tensor([0], device='cuda')).backward()
+        >>> torch.nn.AvgPool3d(1)(torch.randn(3, 4, 5, 6, requires_grad=True).cuda()).sum().backward()
         ...
-        RuntimeError: index_add_cuda_ does not have a deterministic implementation...
+        RuntimeError: avg_pool3d_backward_cuda does not have a deterministic implementation...
     """
     _C._set_deterministic_algorithms(mode, warn_only=warn_only)
 
@@ -499,6 +507,113 @@ def is_deterministic_algorithms_warn_only_enabled():
     details.
     """
     return _C._get_deterministic_algorithms_warn_only()
+
+def set_deterministic_debug_mode(debug_mode: Union[builtins.int, str]) -> None:
+    r"""Sets the debug mode for deterministic operations.
+
+    .. note:: This is an alternative interface for
+        :func:`torch.use_deterministic_algorithms`. Refer to that function's
+        documentation for details about affected operations.
+
+    Args:
+        debug_mode(str or int): If "default" or 0, don't error or warn on
+            nondeterministic operations. If "warn" or 1, warn on
+            nondeterministic operations. If "error" or 2, error on
+            nondeterministic operations.
+    """
+
+    # NOTE: builtins.int is used here because int in this scope resolves
+    # to torch.int
+    if not isinstance(debug_mode, (builtins.int, str)):
+        raise TypeError(f'debug_mode must be str or int, but got {type(debug_mode)}')
+
+    if isinstance(debug_mode, str):
+        if debug_mode == 'default':
+            debug_mode = 0
+        elif debug_mode == 'warn':
+            debug_mode = 1
+        elif debug_mode == 'error':
+            debug_mode = 2
+        else:
+            raise RuntimeError(
+                'invalid value of debug_mode, expected one of `default`, '
+                f'`warn`, `error`, but got {debug_mode}')
+
+    if debug_mode == 0:
+        _C._set_deterministic_algorithms(False)
+    elif debug_mode == 1:
+        _C._set_deterministic_algorithms(True, warn_only=True)
+    elif debug_mode == 2:
+        _C._set_deterministic_algorithms(True)
+    else:
+        raise RuntimeError(
+            'invalid value of debug_mode, expected 0, 1, or 2, '
+            f'but got {debug_mode}')
+
+def get_deterministic_debug_mode() -> builtins.int:
+    r"""Returns the current value of the debug mode for deterministic
+    operations. Refer to :func:`torch.set_deterministic_debug_mode`
+    documentation for more details.
+    """
+
+    if _C._get_deterministic_algorithms():
+        if _C._get_deterministic_algorithms_warn_only():
+            return 1
+        else:
+            return 2
+    else:
+        return 0
+
+def get_float32_matmul_precision() -> builtins.str:
+    r"""Returns the current value of float32 matrix multiplication precision. Refer to
+    :func:`torch.set_float32_matmul_precision` documentation for more details.
+    """
+    return _C._get_float32_matmul_precision()
+
+def set_float32_matmul_precision(precision):
+    r"""Sets the internal precision of float32 matrix multiplications.
+
+    Running float32 matrix multiplications in lower precision may significantly increase
+    performance, and in some programs the loss of precision has a negligible impact.
+
+    Supports three settings:
+
+        * "highest", float32 matrix multiplications use the float32 datatype for
+          internal computations.
+        * "high", float32 matrix multiplications use the TensorFloat32 or bfloat16_3x
+          datatypes for internal computations, if fast matrix multiplication algorithms
+          using those datatypes internally are available. Otherwise float32
+          matrix multiplications are computed as if the precision is "highest".
+        * "medium", float32 matrix multiplications use the bfloat16 datatype for
+          internal computations, if a fast matrix multiplication algorithm
+          using that datatype internally is available. Otherwise float32
+          matrix multiplications are computed as if the precision is "high".
+
+    .. note::
+
+        This does not change the output dtype of float32 matrix multiplications,
+        it controls how the internal computation of the matrix multiplication is performed.
+
+    .. note::
+
+        This does not change the precision of convolution operations. Other flags,
+        like `torch.backends.cudnn.allow_tf32`, may control the precision of convolution
+        operations.
+
+    .. note::
+
+        This flag currently only affects one native device type: CUDA.
+        If "high" or "medium" are set then the TensorFloat32 datatype will be used
+        when computing float32 matrix multiplications, equivalent to setting
+        `torch.backends.cuda.matmul.allow_tf32 = True`. When "highest" (the default)
+        is set then the float32 datatype is used for internal computations, equivalent
+        to setting `torch.backends.cuda.matmul.allow_tf32 = False`.
+
+    Args:
+        precision(str): can be set to "highest" (default), "high", or "medium" (see above).
+
+    """
+    _C._set_float32_matmul_precision(precision)
 
 def set_warn_always(b):
     r"""When this flag is False (default) then some PyTorch warnings may only
@@ -532,95 +647,92 @@ __all__.extend(['e', 'pi', 'nan', 'inf'])
 ################################################################################
 
 from ._tensor import Tensor
-from .storage import _StorageBase, TypedStorage
+from .storage import _StorageBase, TypedStorage, _LegacyStorage, UntypedStorage
 
 # NOTE: New <type>Storage classes should never be added. When adding a new
 # dtype, use torch.storage.TypedStorage directly.
 
-class UntypedStorage(_C.ByteStorageBase, _StorageBase):
-    pass
-
-class ByteStorage(TypedStorage):
+class ByteStorage(_LegacyStorage):
     @classproperty
     def dtype(self):
         return torch.uint8
 
-class DoubleStorage(TypedStorage):
+class DoubleStorage(_LegacyStorage):
     @classproperty
     def dtype(self):
         return torch.double
 
-class FloatStorage(TypedStorage):
+class FloatStorage(_LegacyStorage):
     @classproperty
     def dtype(self):
         return torch.float
 
-class HalfStorage(TypedStorage):
+class HalfStorage(_LegacyStorage):
     @classproperty
     def dtype(self):
         return torch.half
 
-class LongStorage(TypedStorage):
+class LongStorage(_LegacyStorage):
     @classproperty
     def dtype(self):
         return torch.long
 
-class IntStorage(TypedStorage):
+class IntStorage(_LegacyStorage):
     @classproperty
     def dtype(self):
         return torch.int
 
-class ShortStorage(TypedStorage):
+class ShortStorage(_LegacyStorage):
     @classproperty
     def dtype(self):
         return torch.short
 
-class CharStorage(TypedStorage):
+class CharStorage(_LegacyStorage):
     @classproperty
     def dtype(self):
         return torch.int8
 
-class BoolStorage(TypedStorage):
+class BoolStorage(_LegacyStorage):
     @classproperty
     def dtype(self):
         return torch.bool
 
-class BFloat16Storage(TypedStorage):
+class BFloat16Storage(_LegacyStorage):
     @classproperty
     def dtype(self):
         return torch.bfloat16
 
-class ComplexDoubleStorage(TypedStorage):
+class ComplexDoubleStorage(_LegacyStorage):
     @classproperty
     def dtype(self):
         return torch.cdouble
 
-class ComplexFloatStorage(TypedStorage):
+class ComplexFloatStorage(_LegacyStorage):
     @classproperty
     def dtype(self):
         return torch.cfloat
 
-class QUInt8Storage(TypedStorage):
+class QUInt8Storage(_LegacyStorage):
     @classproperty
     def dtype(self):
         return torch.quint8
 
-class QInt8Storage(TypedStorage):
+class QInt8Storage(_LegacyStorage):
     @classproperty
     def dtype(self):
         return torch.qint8
 
-class QInt32Storage(TypedStorage):
+class QInt32Storage(_LegacyStorage):
     @classproperty
     def dtype(self):
         return torch.qint32
 
-class QUInt4x2Storage(TypedStorage):
+class QUInt4x2Storage(_LegacyStorage):
     @classproperty
     def dtype(self):
         return torch.quint4x2
 
-class QUInt2x4Storage(TypedStorage):
+class QUInt2x4Storage(_LegacyStorage):
     @classproperty
     def dtype(self):
         return torch.quint2x4
@@ -630,6 +742,7 @@ _storage_classes = {
     ShortStorage, CharStorage, ByteStorage, HalfStorage, BoolStorage,
     QUInt8Storage, QInt8Storage, QInt32Storage, BFloat16Storage,
     ComplexFloatStorage, ComplexDoubleStorage, QUInt4x2Storage, QUInt2x4Storage,
+    TypedStorage
 }
 
 # The _tensor_classes set is initialized by the call to _C._initialize_tensor_type_bindings()
@@ -653,7 +766,7 @@ def manager_path():
         raise RuntimeError("Unable to find torch_shm_manager at " + path)
     return path.encode('utf-8')
 
-from .autocast_mode import autocast
+from torch.amp import autocast
 
 # Shared memory manager needs to know the exact location of manager executable
 _C._initExtension(manager_path())
@@ -678,8 +791,11 @@ PRIVATE_OPS = (
 for name in dir(_C._VariableFunctions):
     if name.startswith('__') or name in PRIVATE_OPS:
         continue
-    globals()[name] = getattr(_C._VariableFunctions, name)
-    __all__.append(name)
+    obj = getattr(_C._VariableFunctions, name)
+    obj.__module__ = 'torch'
+    globals()[name] = obj
+    if not name.startswith("_"):
+        __all__.append(name)
 
 ################################################################################
 # Import interface functions defined in Python
@@ -693,7 +809,8 @@ from .functional import *  # noqa: F403
 # Remove unnecessary members
 ################################################################################
 
-del ByteStorageBase
+del _StorageBase
+del _LegacyStorage
 
 ################################################################################
 # Define _assert
@@ -727,12 +844,9 @@ from torch.autograd import (
 )
 from torch import fft as fft
 from torch import futures as futures
+from torch import nested as nested
 from torch import nn as nn
-import torch.nn.intrinsic
-import torch.nn.quantizable
-import torch.nn.quantized
-# AO depends on nn, as well as quantized stuff -- so should be after those.
-from torch import ao as ao
+from torch.signal import windows as windows
 from torch import optim as optim
 import torch.optim._multi_tensor
 from torch import multiprocessing as multiprocessing
@@ -747,6 +861,8 @@ from torch import random as random
 from torch import distributions as distributions
 from torch import testing as testing
 import torch.backends.cuda
+import torch.backends.mps
+import torch.backends.cudnn
 import torch.backends.mkl
 import torch.backends.mkldnn
 import torch.backends.openmp
@@ -755,6 +871,15 @@ import torch.utils.data
 from torch import __config__ as __config__
 from torch import __future__ as __future__
 from torch import profiler as profiler
+
+# Quantized, sparse, AO, etc. should be last to get imported, as nothing
+# is expected to depend on them.
+from torch import ao as ao
+# nn.quant* depends on ao -- so should be after those.
+import torch.nn.quantizable
+import torch.nn.quantized
+import torch.nn.qat
+import torch.nn.intrinsic
 
 _C._init_names(list(torch._storage_classes))
 
@@ -806,7 +931,15 @@ from torch.utils.dlpack import from_dlpack, to_dlpack
 # Import experimental masked operations support. See
 # [RFC-0016](https://github.com/pytorch/rfcs/pull/27) for more
 # information.
-from . import _masked
+from . import masked
+
+# Import removed ops with error message about removal
+from ._linalg_utils import (  # type: ignore[misc]
+    matrix_rank,
+    eig,
+    solve,
+    lstsq,
+)
 
 
 def _register_device_module(device_type, module):
@@ -823,3 +956,18 @@ def _register_device_module(device_type, module):
         raise RuntimeError("The runtime module of '{}' has already "
                            "been registered with '{}'".format(device_type, getattr(m, device_type)))
     setattr(m, device_type, module)
+    torch_module_name = '.'.join([__name__, device_type])
+    sys.modules[torch_module_name] = module
+
+# expose return_types
+from . import return_types
+if sys.executable != 'torch_deploy' and os.environ.get('PYTORCH_DISABLE_LIBRARY', "0") == "0":
+    from . import library
+    if not TYPE_CHECKING:
+        from . import _meta_registrations
+
+# Enable CUDA Sanitizer
+if 'TORCH_CUDA_SANITIZER' in os.environ:
+    import torch.cuda._sanitizer as csan
+
+    csan.enable_cuda_sanitizer()

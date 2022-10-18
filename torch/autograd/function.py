@@ -8,15 +8,33 @@ import warnings
 from collections import OrderedDict
 from typing import Any, List, Optional
 
+__all__ = ["FunctionCtx", "BackwardCFunction", "FunctionMeta", "Function", "once_differentiable", "traceable",
+           "InplaceFunction", "NestedIOFunction"]
+
 # Formerly known as: _ContextMethodMixin
 class FunctionCtx(object):
 
     def save_for_backward(self, *tensors: torch.Tensor):
         r"""Saves given tensors for a future call to :func:`~Function.backward`.
 
-        **This should be called at most once, and only from inside the**
-        :func:`forward` **method. This should only be called with input or
-        output tensors**
+        ``save_for_backward`` should be called at most once, only from inside the
+        :func:`forward` method, and only with tensors.
+
+        All tensors intended to be used in the backward pass should be saved
+        with ``save_for_backward`` (as opposed to directly on ``ctx``) to prevent
+        incorrect gradients and memory leaks, and enable the application of saved
+        tensor hooks. See :class:`torch.autograd.graph.saved_tensors_hooks`.
+
+        Note that if intermediary tensors, tensors that are neither inputs
+        nor outputs of :func:`forward`, are saved for backward, your custom Function
+        may not support double backward.
+        Custom Functions that do not support double backward should decorate their
+        :func:`backward` method with ``@once_differentiable`` so that performing
+        double backward raises an error. If you'd like to support double backward,
+        you can either recompute intermediaries based on the inputs during backward
+        or return the intermediaries as the outputs of the custom Function. See the
+        `double backward tutorial <https://pytorch.org/tutorials/intermediate/custom_function_double_backward_tutorial.html>`_
+        for more details.
 
         In :func:`backward`, saved tensors can be accessed through the :attr:`saved_tensors`
         attribute. Before returning them to the user, a check is made to ensure
@@ -30,19 +48,19 @@ class FunctionCtx(object):
             >>> class Func(Function):
             >>>     @staticmethod
             >>>     def forward(ctx, x: torch.Tensor, y: torch.Tensor, z: int):
-            >>>         w = x * y * z
-            >>>         out = x * y + y * z + w
-            >>>         ctx.save_for_backward(x, y, out)
+            >>>         w = x * z
+            >>>         out = x * y + y * z + w * y
+            >>>         ctx.save_for_backward(x, y, w, out)
             >>>         ctx.z = z  # z is not a tensor
-            >>>         ctx.w = w  # w is neither input nor output
             >>>         return out
             >>>
             >>>     @staticmethod
+            >>>     @once_differentiable
             >>>     def backward(ctx, grad_out):
-            >>>         x, y, out = ctx.saved_tensors
+            >>>         x, y, w, out = ctx.saved_tensors
             >>>         z = ctx.z
             >>>         gx = grad_out * (y + y * z)
-            >>>         gy = grad_out * (x + z + x * z)
+            >>>         gy = grad_out * (x + z + w)
             >>>         gz = None
             >>>         return gx, gy, gz
             >>>
@@ -53,6 +71,58 @@ class FunctionCtx(object):
 
         """
         self.to_save = tensors
+
+    def save_for_forward(self, *tensors: torch.Tensor):
+        r"""Saves given tensors for a future call to :func:`~Function.jvp`.
+
+        ``save_for_forward`` should be only called once, from inside the :func:`forward`
+        method, and only be called with tensors.
+
+        In :func:`jvp`, saved objects can be accessed through the :attr:`saved_tensors`
+        attribute.
+
+        Arguments can also be ``None``. This is a no-op.
+
+        See :ref:`extending-autograd` for more details on how to use this method.
+
+        Example::
+            >>> # xdoctest: +SKIP
+            >>> class Func(torch.autograd.Function):
+            >>>     @staticmethod
+            >>>     def forward(ctx, x: torch.Tensor, y: torch.Tensor, z: int):
+            >>>         ctx.save_for_backward(x, y)
+            >>>         ctx.save_for_forward(x, y)
+            >>>         ctx.z = z
+            >>>         return x * y * z
+            >>>
+            >>>     @staticmethod
+            >>>     def jvp(ctx, x_t, y_t, _):
+            >>>         x, y = ctx.saved_tensors
+            >>>         z = ctx.z
+            >>>         return z * (y * x_t + x * y_t)
+            >>>
+            >>>     @staticmethod
+            >>>     def vjp(ctx, grad_out):
+            >>>         x, y = ctx.saved_tensors
+            >>>         z = ctx.z
+            >>>         return z * grad_out * y, z * grad_out * x, None
+            >>>
+            >>>     a = torch.tensor(1., requires_grad=True, dtype=torch.double)
+            >>>     t = torch.tensor(1., dtype=torch.double)
+            >>>     b = torch.tensor(2., requires_grad=True, dtype=torch.double)
+            >>>     c = 4
+            >>>
+            >>>     with fwAD.dual_level():
+            >>>         a_dual = fwAD.make_dual(a, t)
+            >>>         d = Func.apply(a_dual, b, c)
+
+        """
+        for tensor in tensors:
+            assert isinstance(tensor, torch.Tensor) or tensor is None, (
+                "save_for_forward expects all arguments to be tensors; you should "
+                "save non-tensors as attributes on ctx.")
+
+        self.saved_for_forward = tensors
 
     def mark_dirty(self, *args: torch.Tensor):
         r"""Marks given tensors as modified in an in-place operation.
@@ -83,6 +153,7 @@ class FunctionCtx(object):
             >>> b = a * a
             >>> Inplace.apply(a)  # This would lead to wrong gradients!
             >>>                   # but the engine would not know unless we mark_dirty
+            >>> # xdoctest: +SKIP
             >>> b.backward() # RuntimeError: one of the variables needed for gradient
             >>>              # computation has been modified by an inplace operation
 
@@ -248,6 +319,7 @@ class Function(with_metaclass(FunctionMeta, _C._FunctionBase, FunctionCtx, _Hook
         >>>         return grad_output * result
         >>>
         >>> # Use it by calling the apply method:
+        >>> # xdoctest: +SKIP
         >>> output = Exp.apply(input)
     """
     def __init__(self, *args, **kwargs):
@@ -276,7 +348,12 @@ class Function(with_metaclass(FunctionMeta, _C._FunctionBase, FunctionCtx, _Hook
         number of arguments (tensors or other types).
 
         The context can be used to store arbitrary data that can be then
-        retrieved during the backward pass.
+        retrieved during the backward pass. Tensors should not be stored
+        directly on `ctx` (though this is not currently enforced for
+        backward compatibility). Instead, tensors should be saved either with
+        :func:`ctx.save_for_backward` if they are intended to be used in
+        ``backward`` (equivalently, ``vjp``) or :func:`ctx.save_for_forward`
+        if they are intended to be used for in ``jvp``.
         """
         raise NotImplementedError("You must implement the forward function for custom"
                                   " autograd.Function.")

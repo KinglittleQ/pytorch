@@ -2,6 +2,7 @@
 
 #include <torch/csrc/jit/codegen/cuda/fusion.h>
 #include <torch/csrc/jit/codegen/cuda/ir_all_nodes.h>
+#include <torch/csrc/jit/codegen/cuda/ir_builder.h>
 #include <torch/csrc/jit/codegen/cuda/type.h>
 
 #include <fstream>
@@ -303,13 +304,13 @@ void IrGraphGenerator::generateScheduleGraph() {
       // Maybe not the best way to handle the root domain, but should be okay
       addArc(
           tv,
-          new TensorDomain(tv->getRootDomain()),
+          IrBuilder::create<TensorDomain>(tv->getRootDomain()),
           "[style=dashed, color=green, arrowhead=none]");
 
       if (tv->domain()->hasRFactor())
         addArc(
             tv,
-            new TensorDomain(tv->domain()->getRFactorDomain()),
+            IrBuilder::create<TensorDomain>(tv->domain()->getRFactorDomain()),
             "[style=dashed, color=green, arrowhead=none]");
     }
   }
@@ -370,6 +371,10 @@ void IrGraphGenerator::handle(const Int* i) {
   printValue(i, IrNodeLabel::gen(i, detail_level_));
 }
 
+void IrGraphGenerator::handle(const ComplexDouble* i) {
+  printValue(i, IrNodeLabel::gen(i, detail_level_));
+}
+
 void IrGraphGenerator::handle(const NamedScalar* i) {
   printValue(i, IrNodeLabel::gen(i, detail_level_));
 }
@@ -400,6 +405,17 @@ void IrGraphGenerator::handle(const TensorView* tv) {
              << "\", shape=Mrecord, color=brown, " << style << "];\n";
 
   tensor_views_.push_back(tv);
+}
+
+void IrGraphGenerator::handle(const ARangeOp* uop) {
+  // node
+  printExpr(uop, "arange");
+
+  // inputs & outputs
+  addArc(uop->start(), uop);
+  addArc(uop->end(), uop);
+  addArc(uop->step(), uop);
+  addArc(uop, uop->output(0));
 }
 
 void IrGraphGenerator::handle(const UnaryOp* uop) {
@@ -436,6 +452,16 @@ void IrGraphGenerator::handle(const TernaryOp* op) {
   addArc(op->in2(), op, "[color=blue]");
   addArc(op->in3(), op, "[color=brown]");
   addArc(op, op->out());
+}
+
+void IrGraphGenerator::handle(const RNGOp* op) {
+  // node
+  std::stringstream label;
+  label << op->getRNGOpType();
+  printExpr(op, label.str());
+
+  // inputs & outputs
+  addArc(op, op->output(0));
 }
 
 void IrGraphGenerator::handle(const BroadcastOp* op) {

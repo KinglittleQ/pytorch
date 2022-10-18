@@ -3,11 +3,12 @@
 #ifdef USE_RPC
 #include <torch/csrc/distributed/rpc/rref_context.h>
 #endif
-#include <aten/src/ATen/quantized/Quantizer.h>
+#include <ATen/quantized/Quantizer.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/jit/api/function_impl.h>
 #include <torch/csrc/jit/serialization/pickler.h>
 #include <string>
+#include <type_traits>
 
 namespace torch {
 namespace jit {
@@ -374,6 +375,18 @@ void Pickler::pushLiteralSparseTensor(const at::Tensor& tensor) {
       // values
       pushTensor(tensor._values());
       break;
+    case static_cast<int>(c10::Layout::SparseCsr):
+      push<PickleOpCode>(PickleOpCode::MARK);
+      for (auto size : tensor.sizes()) {
+        pushInt(size);
+      }
+      push<PickleOpCode>(PickleOpCode::TUPLE);
+
+      pushIValue(tensor.requires_grad());
+      pushTensor(tensor.crow_indices());
+      pushTensor(tensor.col_indices());
+      pushTensor(tensor.values());
+      break;
     default:
       TORCH_CHECK(
           false,
@@ -554,16 +567,32 @@ void Pickler::pushTensorReference(const IValue& ivalue) {
 // ivalue to the stack as a string so we can preserve type tags across
 // serialization
 void Pickler::startTypeTag() {
-  pushGlobal("torch.jit._pickle", "restore_type_tag");
+  if (tag_aggregates_) {
+    pushGlobal("torch.jit._pickle", "restore_type_tag");
+  }
 }
+namespace {
+c10::optional<std::string> type_printer(const c10::Type& type) {
+  if (auto dyn = type.castRaw<c10::DynamicType>()) {
+    return dyn->fallback()->annotation_str(type_printer);
+  }
+  return c10::nullopt;
+}
+} // namespace
 
 // See startTypeTag
 void Pickler::endTypeTag(const IValue& ivalue) {
+  if (!tag_aggregates_) {
+    return;
+  }
   TORCH_INTERNAL_ASSERT(ivalue.isGenericDict() || ivalue.isList());
 
   // Push the dict type
   TORCH_INTERNAL_ASSERT(ivalue.type());
-  pushString(ivalue.type()->annotation_str());
+
+  auto type = ivalue.type();
+  auto annot_str = type->annotation_str(type_printer);
+  pushString(annot_str);
 
   // Pop the dict and type into a tuple
   push<PickleOpCode>(PickleOpCode::TUPLE2);
@@ -579,17 +608,18 @@ void Pickler::pushDict(const IValue& ivalue) {
 
   push<PickleOpCode>(PickleOpCode::EMPTY_DICT);
 
-  if (dict.size() >= 0) {
-    push<PickleOpCode>(PickleOpCode::MARK);
+  static_assert(
+      std::is_unsigned<decltype(dict.size())>::value,
+      "Expected size to be non-negative.");
+  push<PickleOpCode>(PickleOpCode::MARK);
 
-    // Sort the dict for deterministic keys
-    for (const auto& entry : dict) {
-      pushIValue(entry.key());
-      pushIValue(entry.value());
-    }
-
-    push<PickleOpCode>(PickleOpCode::SETITEMS);
+  // Sort the dict for deterministic keys
+  for (const auto& entry : dict) {
+    pushIValue(entry.key());
+    pushIValue(entry.value());
   }
+
+  push<PickleOpCode>(PickleOpCode::SETITEMS);
 
   endTypeTag(ivalue);
 }

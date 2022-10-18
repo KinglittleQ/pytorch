@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 from torch._C._distributed_rpc import _get_current_rpc_agent
 
+__all__ = ["RPCExecMode", "serialize", "deserialize", "PythonUDF", "RemoteException"]
 
 # Thread local tensor tables to store tensors while pickling torch.Tensor
 # objects
@@ -167,6 +168,8 @@ class _InternalRPCPickler:
             callee modules."""
             )
             ret = AttributeError(except_str)
+            # Ensure the stack trace gets preserved
+            ret.__cause__ = e
 
         # restore _thread_local_tensor_tables.recv_tables if return
         # from nested call, otherwise clean up the table

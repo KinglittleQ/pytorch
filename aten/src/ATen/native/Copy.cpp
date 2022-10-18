@@ -1,19 +1,29 @@
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/native/Copy.h>
 
-#include <ATen/ATen.h>
+#include <ATen/core/Tensor.h>
 #include <ATen/Dispatch.h>
-#include <ATen/NativeFunctions.h>
-#include <ATen/native/TensorIterator.h>
+#include <ATen/FunctionalTensorWrapper.h>
+#include <ATen/TensorIterator.h>
 #include <ATen/native/quantized/Copy.h>
+#include <ATen/native/mps/Copy.h>
 #include <ATen/native/vulkan/ops/Copy.h>
 #include <ATen/quantized/Quantizer.h>
 #include <ATen/vulkan/Context.h>
 #include <ATen/metal/Context.h>
-#include <ATen/MemoryOverlap.h>
 #include <ATen/NamedTensorUtils.h>
 #include <ATen/Parallel.h>
 #include <c10/util/irange.h>
-#include <torch/library.h>
+
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/Functions.h>
+#include <ATen/NativeFunctions.h>
+#else
+#include <ATen/ops/_copy_from.h>
+#include <ATen/ops/copy_native.h>
+#include <ATen/ops/empty.h>
+#include <ATen/ops/expand_copy.h>
+#endif
 
 #ifdef USE_FBGEMM
 #include <fbgemm/Fbgemm.h>
@@ -30,6 +40,8 @@ bool copy_transpose_valid(const Tensor& self, const Tensor& src) {
       src.stride(0) == 1 && src.stride(1) == src.size(0) &&
       self.scalar_type() == src.scalar_type() &&
       self.sizes().equals(src.sizes()) &&
+      self.is_neg() == src.is_neg() &&
+      self.is_conj() == src.is_conj() &&
       self.numel() >= MIN_SZ;
 }
 
@@ -50,7 +62,7 @@ void copy_same_type_transpose_(Tensor& self, const Tensor& src) {
   // The code below is implemented with the assumption that sizes are equal
   TORCH_INTERNAL_ASSERT_DEBUG_ONLY(self.sizes().equals(src.sizes()));
 
-  AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND3(kHalf, kBool, kBFloat16, self.scalar_type(), "copy_", [&] {
+  AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4(kHalf, kBool, kBFloat16, kComplexHalf, self.scalar_type(), "copy_", [&] {
     scalar_t* sp = src.data_ptr<scalar_t>();
     scalar_t* rp = self.data_ptr<scalar_t>();
     scalar_t* bp = buf.data_ptr<scalar_t>();
@@ -95,7 +107,7 @@ void copy_same_type_transpose_(Tensor& self, const Tensor& src) {
 // (e.g. XLA) may be supported by overriding copy_ and _copy_from.
 bool is_supported_device(Device device) {
   DeviceType device_type = device.type();
-  return device_type == kCPU || device_type == kCUDA || device_type == kHIP || device_type == kVulkan || device_type == kMetal;
+  return device_type == kCPU || device_type == kCUDA || device_type == kHIP || device_type == kVulkan || device_type == kMetal || device_type == kMPS;
 }
 
 } // namespace
@@ -182,7 +194,7 @@ static Tensor & copy_impl(Tensor & self, const Tensor & src, bool non_blocking) 
   }
 
   if (self.is_quantized() && !src.is_quantized()) {
-    return quantized_copy_from_float_cpu_(self, src);
+    return quantized_copy_from_float_(self, src);
   }
 
   if (self.is_quantized() && src.is_quantized()) {
@@ -208,6 +220,7 @@ static Tensor & copy_impl(Tensor & self, const Tensor & src, bool non_blocking) 
     return at::metal::metal_copy_(self, src);
   }
 
+
   auto iter = TensorIteratorConfig()
     .add_output(self)
     .add_input(src)
@@ -225,6 +238,8 @@ static Tensor & copy_impl(Tensor & self, const Tensor & src, bool non_blocking) 
     device_type = kCUDA;
   } else if (iter.device_type(1) == kHIP) {
     device_type = kHIP;
+  } else if (iter.device_type(1) == kMPS) {
+    device_type = kMPS;
   }
 
   // TODO: if we need to, we can also enable this path for quantized tensor
@@ -233,6 +248,12 @@ static Tensor & copy_impl(Tensor & self, const Tensor & src, bool non_blocking) 
     return self;
   }
 
+#ifdef USE_MPS
+  if (self.device().type() == at::kMPS || src.device().type() == at::kMPS) {
+    return at::native::mps::mps_copy_(self, src, non_blocking);
+  }
+#endif
+
   if(!self.is_complex() && src.is_complex()) {
     TORCH_WARN_ONCE("Casting complex values to real discards the imaginary part");
   }
@@ -240,17 +261,46 @@ static Tensor & copy_impl(Tensor & self, const Tensor & src, bool non_blocking) 
   return self;
 }
 
+Tensor copy(const Tensor& self, const Tensor& src, bool non_blocking) {
+  // copy() is the "functional" form of copy_(). It exists so we can properly functionalize copy_(), but:
+  // (1) It isn't exposed to the frontend (no python bindings)
+  // (2) It isn't exposed to the backend (it's a composite, that decomposes into to() and expand_as() calls.
+  // Note: This implementation doesn't currently preserve the strides of `self`.
+  // That might be fine for functorch (which already doesn't preserve strides in vmap),
+  // but it's worth looking into whether or not this implementation will be problematic for LazyTensor/XLA.
+  auto intermediate = src.to(self, non_blocking);
+  // We can't use expand() here. Why?
+  // The contract for copy_() is that the output tensor has the same amount of storage as the original tensor.
+  // e.g. This should work:
+  //   a = torch.ones(4, 4)
+  //   b = torch.ones(1, 4)
+  //   c = torch.ones(4, 4)
+  //   torch.ops.aten.copy(a, b).add_(c)
+  // We don't want to emit an extra copy every time though, so we only do it if the shapes are different.
+  if (self.sym_sizes() != intermediate.sym_sizes()) {
+    return at::expand_copy_symint(intermediate, self.sym_sizes());
+  } else {
+    return intermediate;
+  }
+}
+
 Tensor& copy_(Tensor& self, const Tensor& src, bool non_blocking) {
   auto maybe_outnames = namedinference::compute_broadcast_outnames(self, src);
   {
     NoNamesGuard guard;
+    if (self._is_zerotensor()) {
+     TORCH_CHECK(false, "ZeroTensors are immutable. Please materialize the tensor using `.clone()`, if you want a mutable zero tensor.");
+    }
+    if (src._is_zerotensor()) {
+      return self.zero_();
+    }
     copy_impl(self, src, non_blocking);
   }
   namedinference::propagate_names_if_nonempty(self, maybe_outnames);
   return self;
 }
 
-void copy_ignoring_overlaps(const Tensor &dst, const Tensor &src) {
+void copy_ignoring_overlaps(const TensorBase &dst, const TensorBase &src) {
   // Called when we are copying into an overlapping index `dst`, but we don't
   // care which writer wins. Hacky but it works. This is only used by
   // CUDA_tensor_apply2 in case that there are write overlaps.

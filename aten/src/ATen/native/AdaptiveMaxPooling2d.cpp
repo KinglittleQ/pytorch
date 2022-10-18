@@ -1,8 +1,15 @@
-#include <ATen/ATen.h>
-#include <ATen/NativeFunctions.h>
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#include <ATen/core/Tensor.h>
 #include <ATen/native/AdaptivePooling.h>
 #include <c10/util/irange.h>
 
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/Functions.h>
+#include <ATen/NativeFunctions.h>
+#else
+#include <ATen/ops/adaptive_max_pool2d_backward_native.h>
+#include <ATen/ops/adaptive_max_pool2d_native.h>
+#endif
 
 namespace at {
 namespace meta {
@@ -37,13 +44,13 @@ TORCH_META_FUNC(adaptive_max_pool2d) (const Tensor& input, IntArrayRef output_si
 
   /* resize output */
   if (input.ndimension() == 3) {
-    set_output(0, {sizeD, osizeH, osizeW}, input.options());
+    set_output_raw_strided(0, {sizeD, osizeH, osizeW}, {}, input.options());
     /* indices will contain i,j locations for each output point */
-    set_output(1, {sizeD, osizeH, osizeW}, input.options().dtype(kLong));
+    set_output_raw_strided(1, {sizeD, osizeH, osizeW}, {}, input.options().dtype(kLong));
   } else {
-    set_output(0, {sizeB, sizeD, osizeH, osizeW}, input.options().memory_format(input.suggest_memory_format()));
+    set_output_raw_strided(0, {sizeB, sizeD, osizeH, osizeW}, {}, input.options().memory_format(input.suggest_memory_format()));
     /* indices will contain i,j locations for each output point */
-    set_output(1, {sizeB, sizeD, osizeH, osizeW}, input.options().memory_format(input.suggest_memory_format()).dtype(kLong));
+    set_output_raw_strided(1, {sizeB, sizeD, osizeH, osizeW}, {}, input.options().memory_format(input.suggest_memory_format()).dtype(kLong));
   }
 }
 
@@ -62,7 +69,7 @@ TORCH_META_FUNC(adaptive_max_pool2d_backward)
   TORCH_CHECK(input.dtype() == grad_output.dtype(),
     "expected dtype ", input.dtype(), " for `grad_output` but got dtype ", grad_output.dtype());
 
-  set_output(0, input.sizes(), input.options().memory_format(input.suggest_memory_format()));
+  set_output_raw_strided(0, input.sizes(), {}, input.options().memory_format(input.suggest_memory_format()));
 }
 } // namespace meta
 

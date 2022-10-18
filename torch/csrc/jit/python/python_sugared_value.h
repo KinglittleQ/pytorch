@@ -96,7 +96,6 @@ struct VISIBILITY_HIDDEN PythonModuleValue : public PythonValue {
 
 // Used for desugaring uses of the torch.cuda module. All the CUDA APIs with
 // torch.cuda.* are resolved using CUDAPythonModuleValue.
-#if !defined(USE_ROCM)
 struct VISIBILITY_HIDDEN CUDAPythonModuleValue : public PythonValue {
   explicit CUDAPythonModuleValue(py::object mod)
       : PythonValue(std::move(mod)) {}
@@ -106,7 +105,6 @@ struct VISIBILITY_HIDDEN CUDAPythonModuleValue : public PythonValue {
       GraphFunction& m,
       const std::string& field) override;
 };
-#endif
 
 // Represents all the parameters of a module as a List[Tensor]
 struct VISIBILITY_HIDDEN ConstantParameterList : public SugaredValue {
@@ -205,6 +203,14 @@ struct VISIBILITY_HIDDEN ModuleValue : public SugaredValue {
       GraphFunction& m);
 
   std::shared_ptr<SugaredDict> getSugaredNamedBufferDict(
+      const SourceRange& loc,
+      GraphFunction& m);
+
+  std::shared_ptr<SugaredDict> getSugaredNamedParameterList(
+      const SourceRange& loc,
+      GraphFunction& m);
+
+  std::shared_ptr<SugaredDict> getSugaredNamedParameterDict(
       const SourceRange& loc,
       GraphFunction& m);
 
@@ -328,7 +334,12 @@ struct VISIBILITY_HIDDEN PythonClassValue : public ClassValue {
 struct VISIBILITY_HIDDEN PythonExceptionValue : public ExceptionValue {
   explicit PythonExceptionValue(const py::object& exception_class)
       : ExceptionValue(
-            py::str(py::getattr(exception_class, "__name__", py::str("")))) {}
+            py::str(py::getattr(exception_class, "__name__", py::str("")))),
+        exception_class_qualified_name_(
+            py::str(py::module::import("torch._jit_internal")
+                        .attr("_qualified_name")(
+                            exception_class,
+                            /*mangle_name=*/false))) {}
 
   std::string kind() const override {
     return "Python exception";
@@ -340,6 +351,9 @@ struct VISIBILITY_HIDDEN PythonExceptionValue : public ExceptionValue {
       at::ArrayRef<NamedValue> args,
       at::ArrayRef<NamedValue> kwargs,
       size_t n_binders) override;
+
+ private:
+  std::string exception_class_qualified_name_;
 };
 
 // Python Slice class.

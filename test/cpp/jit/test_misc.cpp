@@ -1,20 +1,23 @@
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <ATen/core/interned_strings.h>
 #include <ATen/core/ivalue.h>
-#include <torch/csrc/jit/passes/remove_mutation.h>
-
+#include <ATen/core/jit_type_base.h>
 #include <test/cpp/jit/test_utils.h>
+#include <torch/csrc/jit/passes/remove_mutation.h>
+#include <torch/csrc/jit/passes/tensorexpr_fuser.h>
+#include <torch/csrc/jit/tensorexpr/kernel.h>
 
 #include <torch/csrc/autograd/engine.h>
 #include <torch/csrc/autograd/generated/variable_factories.h>
+#include <torch/csrc/autograd/profiler.h>
 #include <torch/csrc/autograd/variable.h>
 #include <torch/csrc/jit/api/function_impl.h>
 #include <torch/csrc/jit/api/module.h>
 #include <torch/csrc/jit/codegen/fuser/interface.h>
-#include <torch/csrc/jit/frontend/code_template.h>
 #include <torch/csrc/jit/frontend/ir_emitter.h>
 #include <torch/csrc/jit/frontend/tracer.h>
 #include <torch/csrc/jit/ir/alias_analysis.h>
@@ -41,15 +44,18 @@
 #include <torch/csrc/jit/passes/requires_grad_analysis.h>
 #include <torch/csrc/jit/passes/restore_mutation.h>
 #include <torch/csrc/jit/passes/shape_analysis.h>
+#include <torch/csrc/jit/passes/symbolic_shape_analysis.h>
 #include <torch/csrc/jit/passes/utils/subgraph_utils.h>
 #include <torch/csrc/jit/runtime/argument_spec.h>
 #include <torch/csrc/jit/runtime/autodiff.h>
 #include <torch/csrc/jit/runtime/custom_operator.h>
+#include <torch/csrc/jit/runtime/decomposition_registry.h>
 #include <torch/csrc/jit/runtime/graph_executor.h>
 #include <torch/csrc/jit/runtime/interpreter.h>
 #include <torch/csrc/jit/runtime/jit_trace.h>
 #include <torch/csrc/jit/runtime/profiling_record.h>
 #include <torch/csrc/jit/runtime/symbolic_script.h>
+#include <torch/csrc/jit/runtime/symbolic_shape_registry.h>
 #include <torch/csrc/jit/serialization/import.h>
 #include <torch/csrc/jit/testing/file_check.h>
 #include <torch/jit.h>
@@ -75,8 +81,6 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
-using namespace torch::autograd::profiler;
 
 namespace torch {
 namespace jit {
@@ -157,15 +161,12 @@ TEST(THNNConvTest, Basic) {
   at::Tensor bias = torch::randn({out_channels});
 
   // run forward eagerly
-  at::Tensor output, finput;
-  std::tie(output, finput) = at::_slow_conv2d_forward(
+  at::Tensor output = at::_slow_conv2d_forward(
       input, weight, kernel_size, bias, stride, padding);
 
   // make grad_outputs
   at::Tensor grad_output =
       torch::randn_like(output, at::MemoryFormat::Preserve);
-  at::Tensor grad_finput =
-      torch::zeros_like(finput, at::MemoryFormat::Preserve);
 
   // run backward eagerly
   at::Tensor grad_input, grad_weight, grad_bias;
@@ -176,7 +177,6 @@ TEST(THNNConvTest, Basic) {
       kernel_size,
       stride,
       padding,
-      finput,
       {true, true, true});
 
   // make JIT graph
@@ -213,7 +213,6 @@ TEST(THNNConvTest, Basic) {
 
   tensor_list tensor_grads_in;
   tensor_grads_in.push_back(grad_output);
-  tensor_grads_in.push_back(grad_finput);
 
   // Get outputs from the interpreter
   tensor_list tensors_out, tensor_grads_out;
@@ -223,7 +222,6 @@ TEST(THNNConvTest, Basic) {
   // prepare expected structs
   tensor_list expected_tensors_out, expected_tensor_grads_out;
   expected_tensors_out.push_back(output);
-  expected_tensors_out.push_back(finput);
   expected_tensor_grads_out.push_back(grad_input);
   expected_tensor_grads_out.push_back(grad_weight);
   expected_tensor_grads_out.push_back(grad_bias);
@@ -563,6 +561,37 @@ TEST(SchemaParserTest, AnnotatedAliasSets) {
   parseSchema("at::what(Tensor(a) foo) -> (Tensor(a))");
 }
 
+TEST(SchemaParserTest, TensorListAnnotatedAliasSets) {
+  const auto s = parseSchema(
+      "at::foo(Tensor(a!) self, Tensor(b!)[] out)"
+      " -> ()");
+  const AliasInfo* selfAliasInfo = s.arguments().at(0).alias_info();
+  const AliasInfo* outAliasInfo = s.arguments().at(1).alias_info();
+  ASSERT_TRUE(
+      selfAliasInfo->beforeSets() ==
+      std::unordered_set<Symbol>{Symbol::fromQualString("alias::a")});
+  ASSERT_TRUE(selfAliasInfo->isWrite());
+
+  ASSERT_TRUE(outAliasInfo->isWrite());
+  ASSERT_TRUE(outAliasInfo->beforeSets().empty());
+  ASSERT_EQ(outAliasInfo->containedTypes().size(), 1);
+
+  auto containedType = outAliasInfo->containedTypes()[0];
+
+  ASSERT_TRUE(containedType.isWrite());
+  ASSERT_TRUE(
+      containedType.beforeSets() ==
+      std::unordered_set<Symbol>{Symbol::fromQualString("alias::b")});
+}
+
+TEST(SchemaParserTest, AnnotatedAliasWithoutBeforeSet) {
+  EXPECT_THAT(
+      []() { parseSchema("at::foo(Tensor(!) self) -> Tensor"); },
+      ::testing::Throws<std::runtime_error>(::testing::Property(
+          &std::runtime_error::what,
+          ::testing::HasSubstr("expected ident but found '!' here"))));
+}
+
 TEST(SchemaParserTest, BeforeAfterSets) {
   const auto s = parseSchema(
       "at::what(Tensor(b|c)[](a!) list, Tensor(c) element)"
@@ -808,15 +837,15 @@ void checkScopeCallbacks() {
   at::addGlobalCallback(at::RecordFunctionCallback(
       [](const at::RecordFunction& fn) -> std::unique_ptr<at::ObserverContext> {
         if (fn.scope() == at::RecordScope::FUNCTION &&
-            std::string(fn.name().str()) == "test_function") {
+            std::string(fn.name()) == "test_function") {
           found_function_scope = true;
         }
         if (fn.scope() == at::RecordScope::TORCHSCRIPT_FUNCTION &&
-            std::string(fn.name().str()) == "test_method") {
+            std::string(fn.name()) == "test_method") {
           found_method_scope = true;
         }
         if (fn.scope() == at::RecordScope::USER_SCOPE &&
-            std::string(fn.name().str()) == "test_user_scope") {
+            std::string(fn.name()) == "test_user_scope") {
           found_user_scope = true;
         }
         return nullptr;
@@ -866,9 +895,9 @@ std::unique_ptr<at::ObserverContext> tracedInputsCallback(
         sizes.push_back(std::vector<int64_t>());
       }
     }
-    traced_inputs.push_back(std::make_tuple(fn.name().str(), sizes));
+    traced_inputs.push_back(std::make_tuple(fn.name(), sizes));
   } else if (fn.scope() == RecordScope::TORCHSCRIPT_FUNCTION) {
-    ts_input_names.insert(fn.name().str());
+    ts_input_names.insert(fn.name());
   }
   return nullptr;
 }
@@ -884,9 +913,9 @@ void tracedOutputsCallback(const RecordFunction& fn, ObserverContext* ctx_ptr) {
         sizes.emplace_back();
       }
     }
-    traced_outputs.push_back(std::make_tuple(fn.name().str(), sizes));
+    traced_outputs.push_back(std::make_tuple(fn.name(), sizes));
   } else if (fn.scope() == RecordScope::TORCHSCRIPT_FUNCTION) {
-    ts_output_names.insert(fn.name().str());
+    ts_output_names.insert(fn.name());
   }
 }
 
@@ -938,7 +967,7 @@ TEST(RecordFunctionTest, TracedTestInputsOutputs) {
 
 static int sampled_cb_ctr = 0;
 std::unique_ptr<ObserverContext> sampledCallback(const RecordFunction& fn) {
-  if (std::string(fn.name().str()) == "test") {
+  if (std::string(fn.name()) == "test") {
     ++sampled_cb_ctr;
   }
   return nullptr;
@@ -946,7 +975,7 @@ std::unique_ptr<ObserverContext> sampledCallback(const RecordFunction& fn) {
 
 static int non_sampled_cb_ctr = 0;
 std::unique_ptr<ObserverContext> nonSampledCallback(const RecordFunction& fn) {
-  if (std::string(fn.name().str()) == "test") {
+  if (std::string(fn.name()) == "test") {
     ++non_sampled_cb_ctr;
   }
   return nullptr;
@@ -1013,7 +1042,7 @@ TEST(RecordFunctionTest, RecordFunctionGuard) {
       [](const RecordFunction& fn) -> std::unique_ptr<at::ObserverContext> {
         std::lock_guard<std::mutex> lock(guard_mtx);
         // NOLINTNEXTLINE(modernize-use-emplace)
-        fn_names.push_back(fn.name().str());
+        fn_names.push_back(fn.name());
         return nullptr;
       }));
   {
@@ -1052,8 +1081,7 @@ TEST(RecordFunctionTest, Callbacks) {
   GraphOptimizerEnabledGuard opt_guard(false);
 
   auto h1 = add_remove_test_add_cb<1>();
-  // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores)
-  auto h2 = add_remove_test_add_cb<2>();
+  add_remove_test_add_cb<2>();
   auto h3 = add_remove_test_add_cb<3>();
 
   { RECORD_USER_SCOPE("test"); }
@@ -1147,7 +1175,6 @@ TEST(RecordFunctionTest, Callbacks) {
   } // END: global test
   { // START: thread local test
     auto ctx_th = std::thread([]() {
-      const int test_val = 234;
       const std::string test_str = "test thread str";
       addThreadLocalCallback(RecordFunctionCallback(
           [](const RecordFunction&
@@ -1223,7 +1250,7 @@ TEST(RecordFunctionTest, Basic) {
     RecordFunctionGuard enable_rec_fn;
     auto handle = addThreadLocalCallback(RecordFunctionCallback(
         [](const RecordFunction& fn) -> std::unique_ptr<at::ObserverContext> {
-          recorded_op = fn.name().str();
+          recorded_op = fn.name();
           return nullptr;
         }));
     ThreadLocalState state;
@@ -1386,23 +1413,117 @@ TEST(ThreadLocalDebugInfoTest, Basic) {
   }
 }
 
-TEST(FallbackGraphsTest, Basic) {
-  static const auto nestGraphIntoFallbackGraph =
-      [](const std::shared_ptr<Graph>& graph) {
-        ProfilingRecord::removeProfileCounter(graph->block());
-        auto fallback =
-            replaceBlockWithFallbackGraph(graph->block(), graph->inputs());
-        for (size_t i = 0; i < graph->outputs().size(); i++) {
-          graph->outputs()[i]->replaceAllUsesWith(fallback->output(i));
-          fallback->output(i)->copyMetadata(graph->outputs()[i]);
-        }
-        for (auto it = graph->block()->nodes().rbegin();
-             it != fallback->iterator();
-             it++) {
-          it.destroyCurrent();
-        }
-      };
+TEST(TestSymIntArrayRef, BasicConversion) {
+  const size_t X = 2, Y = 4, Z = 5;
+  std::vector<int64_t> tgt_size_v{2, 4, 5};
+  std::vector<c10::SymInt> tgt_size({SymInt(X), SymInt(Y), SymInt(Z)});
+  auto a = at::randn({1, 4, 1}, at::kCPU);
+  auto b = a.expand_symint(tgt_size);
+  auto c = a.expand(tgt_size_v);
+  ASSERT_TRUE(torch::allclose(b, c));
+}
 
+TEST(TestSymInt, NarrowCopyWithSymbolicInt) {
+  static const size_t LENGTH = 5;
+  auto a = at::randn({10}, at::kCPU);
+  c10::SymInt si(LENGTH);
+  auto b = a.narrow_copy_symint(0, 0, si);
+  auto c = a.narrow(0, 0, LENGTH);
+  ASSERT_TRUE(torch::allclose(b, c));
+}
+
+TEST(TestSymInt, NarrowCopy) {
+  static const size_t LENGTH = 5;
+  auto a = at::randn({10}, at::kCPU);
+  auto b = a.narrow_copy(0, 0, LENGTH);
+  auto c = a.narrow(0, 0, LENGTH);
+  ASSERT_TRUE(torch::allclose(b, c));
+}
+
+TEST(TestSymInt, AddSymbolicInt) {
+  c10::SymInt a(5);
+  c10::SymInt b(3);
+  ASSERT_TRUE((a + b).expect_int() == 8);
+}
+
+#ifndef C10_MOBILE
+TEST(TestSymInt, TestIntrusive) {
+  auto a = c10::make_intrusive<c10::SymIntNodeImpl>();
+  auto b = c10::make_intrusive<c10::SymIntNodeImpl>();
+  ASSERT_EQ(a.use_count(), 1);
+  ASSERT_EQ(b.use_count(), 1);
+  auto as = a->toSymInt();
+  auto bs = b->toSymInt();
+  ASSERT_EQ(a.use_count(), 2);
+  ASSERT_EQ(b.use_count(), 2);
+  as = bs;
+  ASSERT_EQ(a.use_count(), 1);
+  ASSERT_EQ(b.use_count(), 3);
+}
+
+class TestSymIntNodeImpl : public c10::SymIntNodeImpl {
+ public:
+  TestSymIntNodeImpl(int64_t i) : i_(i) {}
+
+  bool bool_() override {
+    return static_cast<bool>(i_);
+  };
+
+#define OPDEF3(NAME, OP, RET)                                            \
+  RET NAME(const c10::SymIntNode& other) override {                      \
+    return make_intrusive<TestSymIntNodeImpl>(                           \
+        this->i_ OP dynamic_cast<TestSymIntNodeImpl*>(other.get())->i_); \
+  }
+
+#define OPDEF2(NAME, OP) OPDEF3(NAME, OP, c10::SymIntNode)
+  OPDEF2(add, +)
+  OPDEF2(sub, -)
+  OPDEF2(mul, *)
+  OPDEF2(floordiv, /)
+  OPDEF2(mod, %)
+
+  OPDEF2(eq, ==)
+  OPDEF2(ne, !=)
+  OPDEF2(lt, <)
+  OPDEF2(le, <=)
+  OPDEF2(gt, >)
+  OPDEF2(ge, >=)
+#undef OPDEF2
+#undef OPDEF3
+
+  int64_t i_;
+};
+
+TEST(TestSymInt, TestSymIntToSymIntNodeDispatch) {
+  auto get = [](c10::SymInt si) {
+    auto node = si.toSymIntNodeImpl();
+    return dynamic_cast<TestSymIntNodeImpl*>(node.get())->i_;
+  };
+
+  std::vector<int64_t> inputs{0, 1, -1, 4, -4, 777, -777};
+  for (auto i : inputs) {
+    for (auto j : inputs) {
+      auto a = c10::make_intrusive<TestSymIntNodeImpl>(i)->toSymInt();
+      auto b = c10::make_intrusive<TestSymIntNodeImpl>(j)->toSymInt();
+      ASSERT_EQ(get(a + b), i + j);
+      ASSERT_EQ(get(a - b), i - j);
+      ASSERT_EQ(get(a * b), i * j);
+      if (j != 0) {
+        ASSERT_EQ(get(a / b), i / j);
+        ASSERT_EQ(get(a % b), i % j);
+      }
+      ASSERT_EQ(a == b, i == j);
+      ASSERT_EQ(a != b, i != j);
+      ASSERT_EQ(a < b, i < j);
+      ASSERT_EQ(a <= b, i <= j);
+      ASSERT_EQ(a > b, i > j);
+      ASSERT_EQ(a >= b, i >= j);
+    }
+  }
+}
+#endif
+
+TEST(FallbackGraphsTest, Basic) {
   auto x = at::randn({1}, at::kCPU);
   auto y = at::randn({1}, at::kCPU);
   auto stack = createStack({x.clone(), y.clone()});
@@ -1823,6 +1944,15 @@ TEST(JitTracing, Basic) {
   auto graph = build_lstm();
   auto stack = createStack({input, hx, cx, w_ih, w_hh});
   auto traced = TraceGraph(graph, stack);
+
+  // Check that the inputs of traced graph have the same type as the inputs
+  // specified here.
+  ASSERT_EQ(*traced->inputs().at(0)->type(), *TensorType::create(input));
+  ASSERT_EQ(*traced->inputs().at(1)->type(), *TensorType::create(hx));
+  ASSERT_EQ(*traced->inputs().at(2)->type(), *TensorType::create(cx));
+  ASSERT_EQ(*traced->inputs().at(3)->type(), *TensorType::create(w_ih));
+  ASSERT_EQ(*traced->inputs().at(4)->type(), *TensorType::create(w_hh));
+
   Tensor prof_out;
   pop(stack, prof_out);
 
@@ -1990,6 +2120,66 @@ TEST(ProfilerTest, Basic) {
   checkShape(tanh_n->inputs().at(0)->node()->ty(attr::profiled_type), eltwise);
 }
 
+TEST(ProfilerTest, OptionalProfiling) {
+  auto graph = std::make_shared<Graph>();
+  std::unordered_map<std::string, Value*> vmap;
+  parseIR(
+      R"IR(
+graph(%inp : Tensor,
+      %weight : Tensor,
+      %bias : Tensor?):
+  %1 : Tensor = aten::linear(%inp, %weight, %bias)
+  return (%1))IR",
+      &*graph,
+      vmap);
+
+  auto pr = ProfilingRecord::instrumentGraph(graph);
+  pr->profiling_count_ = 2;
+
+  auto input = torch::randn({1, 2});
+  auto weight = torch::randn({2, 2});
+  auto bias = torch::randn({1, 2});
+
+  auto stack = createStack({input, weight, bias});
+  Code cd(pr->profiled_graph_, "");
+  InterpreterState is{cd};
+  is.run(stack);
+
+  testing::FileCheck()
+      .check_count("Tensor? = prim::profile[profiled_type", 1, true)
+      ->run(*pr->profiled_graph_);
+
+  // make sure we recorded the shape
+  auto begin = pr->profiled_graph_->block()->nodes().begin();
+  auto end = pr->profiled_graph_->block()->nodes().end();
+  auto linear = std::find_if(
+      begin, end, [](Node* n) { return n->kind() == aten::linear; });
+  ASSERT_NE(linear, end);
+  std::vector<int64_t> bias_expected_shape = {1, 2};
+  auto profiled_bias = linear->namedInput("bias")->node();
+  checkShape(profiled_bias->ty(attr::profiled_type), bias_expected_shape);
+  ASSERT_EQ(0, profiled_bias->i(attr::seen_none));
+
+  auto none_bias = c10::IValue();
+
+  stack.clear();
+  stack.emplace_back(input);
+  stack.emplace_back(weight);
+  stack.emplace_back(none_bias);
+  is = InterpreterState{cd};
+  is.run(stack);
+
+  // make sure we recorded that "None" was seen.
+  begin = pr->profiled_graph_->block()->nodes().begin();
+  end = pr->profiled_graph_->block()->nodes().end();
+  linear = std::find_if(
+      begin, end, [](Node* n) { return n->kind() == aten::linear; });
+  ASSERT_NE(linear, end);
+  profiled_bias = linear->namedInput("bias")->node();
+  checkShape(profiled_bias->ty(attr::profiled_type), bias_expected_shape);
+  ASSERT_EQ(1, profiled_bias->i(attr::seen_none));
+}
+
 TEST(CallStackTest, Basic) {
   const auto text = R"(
 def ham(x):
@@ -2046,7 +2236,7 @@ def foo(x):
   }
 
   // Check that inlining doesn't corrupt callstack of the callee's nodes.
-  const Function& baz = cu->get_function("baz");
+  const auto& baz = toGraphFunction(cu->get_function("baz"));
   for (Node* n : baz.optimized_graph()->nodes()) {
     if (n->kind() == prim::Constant) {
       if (!n->hasAttribute(attr::value) ||
@@ -2302,6 +2492,13 @@ TEST(FuturesTest, Error) {
   ASSERT_TRUE(strcmp(f1->tryRetrieveErrorMessage().c_str(), "Failed") == 0);
   ASSERT_EQ(sat1, 1);
   ASSERT_EQ(sat2, 1);
+  try {
+    (void)f1->constValue();
+    ASSERT_TRUE(false); // Supposed to throw.
+  } catch (const std::exception& e) {
+    // Original error should be logged.
+    ASSERT_TRUE(std::string(e.what()).find("Failed") != std::string::npos);
+  }
 }
 
 // then
@@ -2550,11 +2747,13 @@ TEST(RecordDebugHandles, Basic) {
     RECORD_EDGE_SCOPE_WITH_DEBUG_HANDLE_AND_INPUTS("my_function", 42, {});
     float x{5.9999}, y{2.1212};
     float z = x / y;
+    (void)z;
   }
   {
     RECORD_USER_SCOPE_WITH_INPUTS("not_my_function", {});
     float x{5.9999}, y{2.1212};
     float z = x / y;
+    (void)z;
   }
   auto profiler_results_ptr = torch::autograd::profiler::disableProfiler();
   const auto& kineto_events = profiler_results_ptr->events();
@@ -2654,7 +2853,8 @@ TEST(ComputeFlopsTest, Basic) {
 
   // Test unknown operator
   std::unordered_map<std::string, c10::IValue> extra_args;
-  flops = computeFlops(std::string("aten::unknown"), extra_args);
+  flops = torch::profiler::impl::computeFlops(
+      std::string("aten::unknown"), extra_args);
   ASSERT_EQ(flops, 0);
 
   // Test aten::conv2d
@@ -2670,7 +2870,8 @@ TEST(ComputeFlopsTest, Basic) {
   extra_args["padding"] = at::IValue(at::IntArrayRef(padding));
   extra_args["stride"] = at::IValue(at::IntArrayRef(stride));
   extra_args["dilation"] = at::IValue(at::IntArrayRef(dilation));
-  flops = computeFlops(std::string("aten::conv2d"), extra_args);
+  flops = torch::profiler::impl::computeFlops(
+      std::string("aten::conv2d"), extra_args);
   ASSERT_EQ(flops, 13440);
 
   // Test aten::conv2d fail
@@ -2678,7 +2879,8 @@ TEST(ComputeFlopsTest, Basic) {
   weight_size = {4, 5, 6};
   extra_args["input_size"] = at::IValue(at::IntArrayRef(input_size));
   extra_args["weight_size"] = at::IValue(at::IntArrayRef(weight_size));
-  flops = computeFlops(std::string("aten::conv2d"), extra_args);
+  flops = torch::profiler::impl::computeFlops(
+      std::string("aten::conv2d"), extra_args);
   ASSERT_EQ(flops, 0);
 
   // Test aten::conv2d fail 2
@@ -2686,14 +2888,16 @@ TEST(ComputeFlopsTest, Basic) {
   stride = {0, 0};
   extra_args["weight_size"] = at::IValue(at::IntArrayRef(input_size));
   extra_args["stride"] = at::IValue(at::IntArrayRef(stride));
-  flops = computeFlops(std::string("aten::conv2d"), extra_args);
+  flops = torch::profiler::impl::computeFlops(
+      std::string("aten::conv2d"), extra_args);
   ASSERT_EQ(flops, 0);
 
   // Test aten::conv2d fail 3
   extra_args.clear();
   input_size = {4, 5, 6, 7};
   extra_args["input_size"] = at::IValue(at::IntArrayRef(input_size));
-  flops = computeFlops(std::string("aten::conv2d"), extra_args);
+  flops = torch::profiler::impl::computeFlops(
+      std::string("aten::conv2d"), extra_args);
   ASSERT_EQ(flops, 0);
 
   // Test aten::mm
@@ -2702,11 +2906,13 @@ TEST(ComputeFlopsTest, Basic) {
   std::vector<int64_t> mat2_sizes = {6, 5, 4, 3};
   extra_args["mat1_size"] = at::IValue(at::IntArrayRef(mat1_sizes));
   extra_args["mat2_size"] = at::IValue(at::IntArrayRef(mat2_sizes));
-  flops = computeFlops(std::string("aten::mm"), extra_args);
+  flops =
+      torch::profiler::impl::computeFlops(std::string("aten::mm"), extra_args);
   ASSERT_EQ(flops, 43200);
 
   // Test aten::addmm
-  flops = computeFlops(std::string("aten::addmm"), extra_args);
+  flops = torch::profiler::impl::computeFlops(
+      std::string("aten::addmm"), extra_args);
   ASSERT_EQ(flops, 43200);
 
   // Test aten::bmm
@@ -2715,30 +2921,35 @@ TEST(ComputeFlopsTest, Basic) {
   mat2_sizes = {7, 6, 3};
   extra_args["mat1_size"] = at::IValue(at::IntArrayRef(mat1_sizes));
   extra_args["mat2_size"] = at::IValue(at::IntArrayRef(mat2_sizes));
-  flops = computeFlops(std::string("aten::bmm"), extra_args);
+  flops =
+      torch::profiler::impl::computeFlops(std::string("aten::bmm"), extra_args);
   ASSERT_EQ(flops, 1260);
 
   // Test aten::baddbmm
-  flops = computeFlops(std::string("aten::baddbmm"), extra_args);
+  flops = torch::profiler::impl::computeFlops(
+      std::string("aten::baddbmm"), extra_args);
   ASSERT_EQ(flops, 1260);
 
   // Test mm out of range
   extra_args.clear();
-  flops = computeFlops(std::string("aten::mm"), extra_args);
+  flops =
+      torch::profiler::impl::computeFlops(std::string("aten::mm"), extra_args);
   ASSERT_EQ(flops, 0);
 
   // Test aten::add.Tensor
   extra_args.clear();
   std::vector<int64_t> mat_sizes = {3, 4, 5, 6};
   extra_args["mat_size"] = at::IValue(at::IntArrayRef(mat_sizes));
-  flops = computeFlops(std::string("aten::add"), extra_args);
+  flops =
+      torch::profiler::impl::computeFlops(std::string("aten::add"), extra_args);
   ASSERT_EQ(flops, 360);
 
   // Test aten::mul.Tensor
   extra_args.clear();
   mat_sizes = {3, 4, 5, 6};
   extra_args["mat_size"] = at::IValue(at::IntArrayRef(mat_sizes));
-  flops = computeFlops(std::string("aten::mul"), extra_args);
+  flops =
+      torch::profiler::impl::computeFlops(std::string("aten::mul"), extra_args);
   ASSERT_EQ(flops, 360);
 }
 
@@ -2786,6 +2997,33 @@ graph(%x.1 : Tensor):
   testing::FileCheck().check_not("aten::relu_")->run(*graph);
 }
 
+TEST(TestRegisterShapeOp, Basic) {
+  auto graph = std::make_shared<Graph>();
+  std::unordered_map<std::string, Value*> vmap;
+  parseIR(
+      R"IR(
+graph():
+  %2 : int = prim::Constant[value=5]()
+  %3: int[] = prim::ListConstruct(%2, %2)
+  return (%3))IR",
+      &*graph,
+      vmap);
+
+  auto g2 = std::make_shared<Graph>();
+  parseIR(
+      R"IR(
+graph():
+  %2 : Tensor = prim::MakeTestTensor()
+  return (%2))IR",
+      &*g2,
+      vmap);
+
+  const FunctionSchema& schema = g2->nodes().begin()->schema();
+  torch::jit::RegisterShapeComputeGraphForSchema(schema, graph);
+  PropagateShapesOnGraph(g2);
+  testing::FileCheck().check("5, 5")->run(*g2);
+}
+
 TEST(TestFunctionalToInplaceActivation, Basic) {
   auto graph = std::make_shared<Graph>();
   std::unordered_map<std::string, Value*> vmap;
@@ -2801,6 +3039,167 @@ graph(%x.1 : Tensor):
   FunctionalToInplaceActivation(graph);
   testing::FileCheck().check("aten::relu_")->run(*graph);
   testing::FileCheck().check_not("aten::relu(")->run(*graph);
+}
+
+TEST(TestFunctionExecutor, SimpleExecutorTest) {
+  auto graph = std::make_shared<Graph>();
+  parseIR(
+      R"IR(
+graph(%x.1 : Tensor):
+  %2 : int = prim::Constant[value=1]()
+  %x.3 : Tensor = aten::add(%x.1, %2, %2)
+  %y : Tensor = aten::relu(%x.3)
+  return (%y))IR",
+      &*graph);
+  {
+    auto func = torch::make_unique<GraphFunction>(
+        "name", graph, [](GraphFunction&) {}, ExecutorExecutionMode::PROFILING);
+    auto a = at::rand({2, 2, 2}, TensorOptions(kCPU).dtype(at::kFloat));
+    Stack stack = {a};
+    func->run(stack);
+    auto g = lastExecutedOptimizedGraph();
+    testing::FileCheck()
+        .check("prim::profile")
+        ->check("aten::add")
+        ->check("aten::relu")
+        ->run(*g);
+  }
+  {
+    auto func = torch::make_unique<GraphFunction>(
+        "name", graph, [](GraphFunction&) {}, ExecutorExecutionMode::SIMPLE);
+    auto a = at::rand({2, 2, 2}, TensorOptions(kCPU).dtype(at::kFloat));
+    Stack stack = {a};
+    func->run(stack);
+    auto g = func->getDebugState().graph;
+    testing::FileCheck()
+        .check_not("prim::profile")
+        ->check("aten::add")
+        ->check("aten::relu")
+        ->run(*g);
+  }
+}
+
+TEST(TestFunctionExecutor, RunDecompositionTest) {
+  static auto* func = torch::jit::GetDecompositionExecutor(
+      "aten::var(Tensor self, bool unbiased=True) -> Tensor");
+  for (bool unbiased : {true, false}) {
+    auto input = at::rand({4, 4});
+    Stack stack = {input, unbiased};
+    func->run(stack);
+    at::Tensor out = pop(stack).toTensor();
+    ASSERT_TRUE(at::allclose(out, input.var(unbiased)));
+  }
+}
+
+TEST(TestShapeGraphLinting, Basic) {
+  auto schemas = RegisteredShapeComputeSchemas();
+  for (const auto& schema : schemas) {
+    // arange does not acually support complex, leave as
+    // union[int, float] for now
+    if (schema->name() == "aten::arange") {
+      continue;
+    }
+    auto g = shapeComputeGraphForSchema(*schema);
+    TORCH_INTERNAL_ASSERT(g);
+    LintShapeComputeGraph(schema, *g);
+  }
+}
+
+// TODO: move to test_kernel when global settings are explicit
+// fusion parameters
+class Composed : public ::testing::Test {
+ public:
+  // NOLINTNEXTLINE(modernize-use-override,cppcoreguidelines-explicit-virtual-functions)
+  void SetUp() {
+    torch::jit::tensorexpr::getTEMustUseLLVMOnCPU() = false;
+  }
+};
+
+TEST_F(Composed, ComposedOp) {
+  struct WithCPUFuser {
+    WithCPUFuser(bool val = true) : cpuFuserEnabled(canFuseOnCPU()) {
+      overrideCanFuseOnCPU(val);
+    }
+
+    ~WithCPUFuser() {
+      overrideCanFuseOnCPU(cpuFuserEnabled);
+    }
+
+    bool cpuFuserEnabled;
+  };
+
+#ifdef TORCH_ENABLE_LLVM
+  const auto graph_string = R"IR(
+      graph(%0 : Float(5, 3, strides=[3, 1], device=cpu),
+            %1 : Float(5, 3, strides=[1, 5], device=cpu)):
+        %2 : Float(5, 3, strides=[3, 1], device=cpu) = aten::mul(%0, %1)
+        %3 : Float(5, 3, strides=[3, 1], device=cpu) = aten::mul(%0, %2)
+        %4 : Float(5, 3, strides=[3, 1], device=cpu) = aten::mul(%0, %3)
+        return (%3, %4))IR";
+  auto graph = std::make_shared<Graph>();
+  parseIR(graph_string, &*graph);
+
+  // wrong input sizes so we hit the fallback path
+  auto a = at::rand({2, 2, 2}, TensorOptions(kCPU).dtype(at::kFloat));
+  auto b = at::rand({2, 2, 2}, TensorOptions(kCPU).dtype(at::kFloat))
+               .transpose(0, 1);
+  auto ref1 = a * (a * b);
+  auto ref2 = a * ref1;
+  WithCPUFuser g(true);
+  bool fusable_on_device = torch::jit::tensorexpr::getTEMustUseLLVMOnCPU();
+  torch::jit::tensorexpr::getTEMustUseLLVMOnCPU() = false;
+  FuseTensorExprs(
+      graph,
+      /*min_group_size*/ 2,
+      /*add_composed_op*/ true,
+      /*fuse_to_dynamic_shapes*/ true);
+  Code code(graph, "");
+  InterpreterState interpreter{code};
+  std::vector<IValue> stack = {a, b};
+  interpreter.run(stack);
+  at::Tensor out2 = pop(stack).toTensor();
+  at::Tensor out1 = pop(stack).toTensor();
+  ASSERT_TRUE(at::allclose(ref1, out1));
+  ASSERT_TRUE(at::allclose(ref2, out2));
+
+  auto inp_1 = at::ones({4, 4}, TensorOptions(kCPU).dtype(at::kFloat));
+  auto inp_2 = at::ones({4, 4}, TensorOptions(kCPU).dtype(at::kFloat));
+  stack = {inp_1, inp_2, a, b};
+  InterpreterState interpreter2{code};
+  interpreter2.run(stack);
+  out2 = pop(stack).toTensor();
+  out1 = pop(stack).toTensor();
+  ASSERT_TRUE(at::allclose(ref1, out1));
+  ASSERT_TRUE(at::allclose(ref2, out2));
+  // inp_1 is on the bottom of the stack, and corresponds
+  // to the second output. inp_2 is on the top corresponds to first output
+  ASSERT_TRUE(at::allclose(inp_1, ref2));
+  ASSERT_TRUE(at::allclose(inp_2, ref1));
+  torch::jit::tensorexpr::getTEMustUseLLVMOnCPU() = fusable_on_device;
+#endif
+}
+
+TEST(ConstantPropagation, CustomClassesCanBePropagated) {
+  const auto src = R"IR(
+    graph():
+        %none: NoneType = prim::Constant()
+        %dim: int = prim::Constant[value=3]()
+        %shape: int[] = prim::ListConstruct(%dim, %dim)
+        %weight: Tensor = aten::ones(%shape, %none, %none, %none, %none)
+        %scale: float = prim::Constant[value=1.]()
+        %zero_point: int = prim::Constant[value=0]()
+        %dtype: int = prim::Constant[value=12]()
+        %weight_q: Tensor = aten::quantize_per_tensor(%weight, %scale, %zero_point, %dtype)
+        %params: __torch__.torch.classes.quantized.LinearPackedParamsBase = quantized::linear_prepack(%weight_q, %none)
+        return (%params)
+  )IR";
+  auto graph = std::make_shared<Graph>();
+  std::unordered_map<std::string, Value*> vmap;
+  parseIR(src, graph.get(), vmap);
+
+  ConstantPropagation(graph);
+
+  testing::FileCheck().check_not("quantized::linear_prepack")->run(*graph);
 }
 
 } // namespace jit

@@ -1,6 +1,6 @@
 // (c) Facebook, Inc. and its affiliates. Confidential and proprietary.
 
-#include <c10d/ParamCommsUtils.hpp>
+#include <torch/csrc/distributed/c10d/ParamCommsUtils.hpp>
 
 namespace torch {
 
@@ -13,8 +13,8 @@ ParamCommsDebugInfo::ParamCommsDebugInfo(
     int outSize,
     at::ScalarType dType,
     std::vector<int64_t> inSplitSizes,
-    std::vector<int64_t> outSplitSizes) :
-      rank_(rank),
+    std::vector<int64_t> outSplitSizes)
+    : rank_(rank),
       columnName_(colName),
       inMessageSize_(inSize),
       outMessageSize_(outSize),

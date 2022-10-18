@@ -4,7 +4,6 @@ from enum import Enum
 
 import torch
 
-
 def is_available() -> bool:
     """
     Returns ``True`` if the distributed package is available. Otherwise,
@@ -40,8 +39,11 @@ if is_available():
         _compute_bucket_assignment_by_size,
         _verify_params_across_processes,
         _test_python_store,
-        _DistributedDebugLevel,
-        _get_debug_mode,
+        DebugLevel,
+        get_debug_level,
+        set_debug_level,
+        set_debug_level_from_env,
+        _make_nccl_premul_sum,
     )
 
     if sys.platform != "win32":
@@ -64,4 +66,20 @@ if is_available():
         _rank_not_in_group,
     )
 
+    from .rendezvous import (
+        rendezvous,
+        _create_store_from_options,
+        register_rendezvous_handler,
+    )
+
     from .remote_device import _remote_device
+
+    set_debug_level_from_env()
+
+else:
+    # This stub is sufficient to get
+    #   python test/test_public_bindings.py -k test_correct_module_names
+    # working even when USE_DISTRIBUTED=0.  Feel free to add more
+    # stubs as necessary.
+    class ProcessGroup:  # type: ignore[no-redef]
+        pass

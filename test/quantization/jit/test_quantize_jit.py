@@ -73,6 +73,7 @@ from torch.testing import FileCheck
 from torch.testing._internal.jit_utils import attrs_with_prefix
 from torch.testing._internal.jit_utils import get_forward
 from torch.testing._internal.jit_utils import get_forward_graph
+from torch.testing._internal.common_utils import skipIfSlowGradcheckEnv
 
 from torch.jit._recursive import wrap_cpp_module
 
@@ -1218,6 +1219,11 @@ class TestQuantizeJitPasses(QuantizationTestCase):
         self.assertEqual(res, ref_res)
 
     def test_swap_functional_linear(self):
+        # TODO: This pass replaces any function called "linear" with "aten::linear"
+        # No longer necessary, and also quite surprising
+        def linear(input, weight, bias):
+            return torch.nn.functional.linear(input, weight, bias)
+
         class M(torch.nn.Module):
             def __init__(self):
                 super(M, self).__init__()
@@ -1225,7 +1231,7 @@ class TestQuantizeJitPasses(QuantizationTestCase):
             def forward(self, x, weight, bias):
                 x = torch.dequantize(x)
                 weight = torch.dequantize(weight)
-                x = F.linear(x, weight, bias)
+                x = linear(x, weight, bias)
                 x = torch.quantize_per_tensor(
                     x, scale=1.0, zero_point=0, dtype=torch.quint8
                 )
@@ -1256,6 +1262,7 @@ class TestQuantizeJitPasses(QuantizationTestCase):
             def __init__(self):
                 super(Res, self).__init__()
                 self.conv = torch.nn.Conv2d(3, 3, 1).float()
+                self.conv2 = torch.nn.Conv2d(3, 3, 1).float()
                 self.use_skip = True
 
             def forward(self, x: torch.Tensor, cond: bool) -> torch.Tensor:
@@ -1264,7 +1271,7 @@ class TestQuantizeJitPasses(QuantizationTestCase):
                 if self.use_skip:
                     return self.conv(x)
                 else:
-                    return self.conv(x)
+                    return self.conv2(x)
 
         class M(torch.nn.Module):
             def __init__(self):
@@ -1408,6 +1415,38 @@ class TestQuantizeJitPasses(QuantizationTestCase):
         )
         FileCheck().check("aten::conv3d").check_not("aten::_convolution").run(
             str(get_forward_graph(m.conv3d._c))
+        )
+
+    def test_convtranspose_trace(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super(M, self).__init__()
+                self.convtranspose1d = torch.nn.ConvTranspose1d(3, 3, 3).float()
+                self.convtranspose2d = torch.nn.ConvTranspose2d(3, 3, 3).float()
+                self.convtranspose3d = torch.nn.ConvTranspose3d(3, 3, 3).float()
+
+            def forward(self, x, y, z):
+                a = self.convtranspose1d(x)
+                b = self.convtranspose2d(y)
+                c = self.convtranspose3d(z)
+                return (a, b, c)
+
+        qconfig_dict = {"": default_qconfig}
+        inputs = (
+            torch.rand((1, 3, 10), dtype=torch.float),
+            torch.rand((1, 3, 10, 10), dtype=torch.float),
+            torch.rand((1, 3, 10, 10, 10), dtype=torch.float),
+        )
+        model = torch.jit.trace(M(), inputs).eval()
+        m = prepare_jit(model, qconfig_dict)
+        FileCheck().check("aten::conv_transpose1d").check_not("aten::_convolution").run(
+            str(get_forward_graph(m.convtranspose1d._c))
+        )
+        FileCheck().check("aten::conv_transpose2d").check_not("aten::_convolution").run(
+            str(get_forward_graph(m.convtranspose2d._c))
+        )
+        FileCheck().check("aten::conv_transpose3d").check_not("aten::_convolution").run(
+            str(get_forward_graph(m.convtranspose3d._c))
         )
 
     @unittest.skipUnless(
@@ -1587,6 +1626,7 @@ class TestQuantizeJitPasses(QuantizationTestCase):
         torch.jit.save(model, b)
 
 
+@skipIfSlowGradcheckEnv
 class TestQuantizeJitOps(QuantizationTestCase):
     """Test graph mode post training static quantization works
     for individual ops end to end.
@@ -3313,14 +3353,11 @@ class TestQuantizeDynamicJitPasses(QuantizationTestCase):
             model = quantize_dynamic_jit(model, qconfig_dict, debug=True)
             graph_qparams = []
             for x, obs in model._modules._c.items():
-                if x == 'fc' and tracing:
-                    graph_qparams.append(
-                        (obs.getattr("weight.6_scale_0"), obs.getattr("weight.6_zero_point_0"))
-                    )
-                else:
-                    graph_qparams.append(
-                        (obs.getattr("weight.1_scale_0"), obs.getattr("weight.1_zero_point_0"))
-                    )
+                n = 2 if x == 'fc' and tracing else 1
+                graph_qparams.append(
+                    (obs.getattr(f"weight.{n}_scale_0"),
+                     obs.getattr(f"weight.{n}_zero_point_0"))
+                )
             self.assertEqual(ref_qparams, graph_qparams)
 
     def test_convert_dynamic_fp16(self):

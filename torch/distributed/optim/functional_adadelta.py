@@ -4,6 +4,8 @@ import torch.optim._functional as F
 
 from torch import Tensor
 
+__all__ : List[str] = []
+
 # Define a TorchScript compatible Functional Adadelta Optimizer
 # where we use these optimizer in a functional way.
 # Instead of using the `param.grad` when updating parameters,
@@ -22,6 +24,8 @@ class _FunctionalAdadelta(object):
         rho: float = 0.9,
         eps: float = 1e-6,
         weight_decay: float = 0.0,
+        foreach: bool = False,
+        maximize: bool = False,
         _allow_empty_param_list: bool = False,
     ):
         self.defaults = {
@@ -30,6 +34,8 @@ class _FunctionalAdadelta(object):
             "eps": eps,
             "weight_decay": weight_decay,
         }
+        self.foreach = foreach
+        self.maximize = maximize
 
         if len(params) == 0 and not _allow_empty_param_list:
             raise ValueError("optimizer got an empty parameter list")
@@ -82,4 +88,6 @@ class _FunctionalAdadelta(object):
                        lr=lr,
                        rho=rho,
                        eps=eps,
-                       weight_decay=weight_decay)
+                       weight_decay=weight_decay,
+                       foreach=self.foreach,
+                       maximize=self.maximize)

@@ -1,14 +1,27 @@
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/native/RNN.h>
-#include <ATen/ATen.h>
+#include <ATen/core/Tensor.h>
 #include <ATen/Config.h>
 #include <ATen/InitialTensorOptions.h>
 #include <ATen/MatrixRef.h>
-#include <ATen/NativeFunctions.h>
 #include <ATen/TensorUtils.h>
 
 #include <ATen/cuda/CUDAConfig.h>
 #include <c10/util/Exception.h>
 #include <c10/util/irange.h>
+
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/Functions.h>
+#include <ATen/NativeFunctions.h>
+#else
+#include <ATen/ops/cat.h>
+#include <ATen/ops/empty.h>
+#include <ATen/ops/miopen_rnn.h>
+#include <ATen/ops/miopen_rnn_native.h>
+#include <ATen/ops/miopen_rnn_backward_native.h>
+#include <ATen/ops/zeros.h>
+#include <ATen/ops/zeros_like.h>
+#endif
 
 #if !AT_ROCM_ENABLED()
 
@@ -36,8 +49,6 @@ namespace at { namespace native {
 }} //namespace at::native
 
 #else // AT_ROCM_ENABLED()
-
-#include <aten/src/THH/THH.h>
 
 #include <ATen/miopen/miopen-wrapper.h>
 #include <ATen/miopen/Descriptors.h>
@@ -354,7 +365,7 @@ std::pair<std::vector<Tensor>, size_t> get_parameters(miopenHandle_t handle, con
             param_size /= elem_size;
 
             if(linear_id == 0 || linear_id == num_linear_layers / 2) {
-                std::initializer_list<int64_t> size = { param_size * num_linear_layers / 2, 1};
+                std::initializer_list<int64_t> size = { static_cast<int64_t>(param_size * num_linear_layers / 2), 1L};
                 Tensor param = at::empty({0}, weight_buf.options()).set_(weight_buf.storage(), offset, size);
                 params.emplace_back(std::move(param));
                 layer_params_count++;
@@ -388,7 +399,7 @@ std::pair<std::vector<Tensor>, size_t> get_parameters(miopenHandle_t handle, con
                 bias_size /= elem_size;
 
                 if(linear_id == 0 || linear_id == num_linear_layers / 2) {
-                    std::initializer_list<int64_t> size = { bias_size * num_linear_layers / 2, 1};
+                    std::initializer_list<int64_t> size = { static_cast<int64_t>(bias_size * num_linear_layers / 2), 1L};
                     Tensor param = at::empty({0}, weight_buf.options()).set_(weight_buf.storage(), offset, size);
                     params.emplace_back(std::move(param));
                     layer_params_count++;

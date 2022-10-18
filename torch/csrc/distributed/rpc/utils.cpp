@@ -492,8 +492,8 @@ std::vector<at::IValue> readWrappedPayload(
   // Read the additional payload remove it from the payload.
   // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
   int64_t additionalPayloadSize;
+  TORCH_INTERNAL_ASSERT(payload.size() >= sizeof(int64_t));
   size_t indexToRead = payload.size() - sizeof(int64_t);
-  TORCH_INTERNAL_ASSERT(indexToRead >= 0);
   torch::utils::THP_decodeInt64Buffer(
       &additionalPayloadSize,
       reinterpret_cast<uint8_t*>(payload.data()) + indexToRead,
@@ -517,7 +517,7 @@ std::vector<at::IValue> readWrappedPayload(
       additionalPayloadSize,
       *rpc::RpcAgent::getCurrentRpcAgent()->getTypeResolver(),
       tensorTable);
-  std::vector<at::IValue> tupleElements = tuple.toTuple()->elements().vec();
+  std::vector<at::IValue> tupleElements = tuple.toTupleRef().elements().vec();
   payload.resize(payload.size() - additionalPayloadSize);
   return tupleElements;
 }

@@ -1,19 +1,23 @@
 from typing import List, Optional
 import logging
 
+import torch
 import torch.distributed.rpc as rpc
 import torch.jit as jit
 import torch.nn as nn
 from torch import Tensor
 from torch.distributed.rpc import RRef
-from torch.distributed.optim import functional_optim_map
+from .utils import functional_optim_map
 import torch.distributed.autograd as dist_autograd
 
 
 from collections import defaultdict
 from threading import Lock
 
+__all__ = ['DistributedOptimizer']
+
 logger = logging.getLogger(__name__)
+
 
 # XXX: we define a _ScriptModuleOptimizer here to explicitly
 # compile the FunctionalOptimizer class into TorchScript
@@ -29,6 +33,7 @@ logger = logging.getLogger(__name__)
 class _ScriptLocalOptimizerInterface(object):
     def step(self, autograd_ctx_id: int) -> None:
         pass
+
 
 class _ScriptLocalOptimizer(nn.Module):
     # TorchScript does not support multithread concurrent compiling.
@@ -103,6 +108,7 @@ def _new_script_local_optimizer(optim_cls, local_params_rref, *args, **kwargs):
         return rpc.RRef(
             script_optim, _ScriptLocalOptimizerInterface)
 
+
 @jit.script
 def _script_local_optimizer_step(
     local_optim_rref: RRef[_ScriptLocalOptimizerInterface],
@@ -110,6 +116,7 @@ def _script_local_optimizer_step(
 ) -> None:
     local_optim = local_optim_rref.local_value()
     local_optim.step(autograd_ctx_id)
+
 
 def _wait_for_all(rpc_futs):
     # TODO: improve error propagation
@@ -160,6 +167,7 @@ class DistributedOptimizer:
         kwargs: arguments to pass to the optimizer constructor on each worker.
 
     Example::
+        >>> # xdoctest: +SKIP("distributed")
         >>> import torch.distributed.autograd as dist_autograd
         >>> import torch.distributed.rpc as rpc
         >>> from torch import optim
@@ -186,6 +194,7 @@ class DistributedOptimizer:
     """
 
     def __init__(self, optimizer_class, params_rref, *args, **kwargs):
+        torch._C._log_api_usage_once("torch.distributed.optim.DistributedOptimizer")
         per_worker_params_rref = defaultdict(list)
         for param in params_rref:
             per_worker_params_rref[param.owner()].append(param)

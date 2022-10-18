@@ -5,7 +5,7 @@
 
 #include <ATen/cpu/vec/intrinsics.h>
 #include <ATen/cpu/vec/vec_base.h>
-#include <ATen/native/quantized/affine_quantizer_base.h>
+#include <ATen/native/quantized/AffineQuantizerBase.h>
 
 #include <c10/util/irange.h>
 #include <c10/util/qint32.h>
@@ -40,7 +40,7 @@
 
 namespace at {
 namespace vec {
-namespace {
+inline namespace CPU_CAPABILITY {
 
 #if defined(CPU_CAPABILITY_AVX2) && !defined(_MSC_VER)
 
@@ -64,17 +64,17 @@ __m256i pack_saturate_and_clamp(
     T max_val);
 
 template <>
-__m256i pack_saturate_and_clamp<int32_t>(
-    __m256i first,
-    __m256i second,
-    int32_t min_val,
-    int32_t max_val) {
+inline __m256i pack_saturate_and_clamp<int32_t>(
+    __m256i /*first*/,
+    __m256i /*second*/,
+    int32_t /*min_val*/,
+    int32_t /*max_val*/) {
   // This function is for linkage only, will not be used
   AT_ERROR("pack_saturate_and_clamp<int32_t> is not supported");
 }
 
 template <>
-__m256i pack_saturate_and_clamp<int8_t>(
+inline __m256i pack_saturate_and_clamp<int8_t>(
     __m256i first,
     __m256i second,
     int8_t min_val,
@@ -86,7 +86,7 @@ __m256i pack_saturate_and_clamp<int8_t>(
 }
 
 template <>
-__m256i pack_saturate_and_clamp<uint8_t>(
+inline __m256i pack_saturate_and_clamp<uint8_t>(
     __m256i first,
     __m256i second,
     uint8_t min_val,
@@ -257,9 +257,22 @@ struct Vectorized<c10::qint32> : public Vectorizedqi {
         return Vectorized<c10::qint32>(ptr);
     }
 
+    static Vectorized<c10::qint32> loadu(const void* ptr, int64_t count) {
+        __at_align__ value_type tmp_values[size()];
+        // Ensure uninitialized memory does not change the output value See https://github.com/pytorch/pytorch/issues/32502
+        // for more details. We do not initialize arrays to zero using "={0}" because gcc would compile it to two
+        // instructions while a loop would be compiled to one instruction.
+        for (const auto i : c10::irange(size())) {
+          tmp_values[i] = 0;
+        }
+        std::memcpy(
+            tmp_values, reinterpret_cast<const value_type*>(ptr), count * sizeof(value_type));
+        return _mm256_loadu_si256((const __m256i*)tmp_values);
+    }
+
     float_vec_return_type dequantize(
         Vectorized<float> scale,
-        Vectorized<float> zero_point,
+        Vectorized<float> /*zero_point*/,
         Vectorized<float> scale_zp_premul) const {
       __m256 float_vals = _mm256_cvtepi32_ps(vals);
       return {vec::fmadd(scale, Vectorized<float>(float_vals), scale_zp_premul)};
@@ -269,7 +282,7 @@ struct Vectorized<c10::qint32> : public Vectorizedqi {
         const float_vec_return_type& rhs,
         float scale,
         int32_t zero_point,
-        float inverse_scale) {
+        float /*inverse_scale*/) {
       Vectorized<c10::qint32> retval;
       auto rhs_data = (__m256)rhs[0];
       at::native::quantize_vec<c10::qint32, /*precision=*/32>(
@@ -417,10 +430,12 @@ struct Vectorized<c10::qint8> : public Vectorizedqi {
     // This is needed because the compiler emits awful code for the default
     // constructor for moving the enum
     // NOLINTNEXTLINE(clang-diagnostic-deprecated-copy)
-    #pragma clang diagnostic push
-    #pragma clang diagnostic ignored "-Wdeprecated-copy"
+    C10_CLANG_DIAGNOSTIC_PUSH()
+    #if C10_CLANG_HAS_WARNING("-Wdeprecated-copy")
+    C10_CLANG_DIAGNOSTIC_IGNORE("-Wdeprecated-copy")
+    #endif
     Vectorized(const Vectorized<c10::qint8>& other) : Vectorizedqi(other.vals) { }
-    #pragma clang diagnostic pop
+    C10_CLANG_DIAGNOSTIC_POP()
 
     void store(void* ptr, int count = size()) const {
         if (count != size()) {
@@ -434,6 +449,19 @@ struct Vectorized<c10::qint8> : public Vectorizedqi {
         return Vectorized<c10::qint8>(ptr);
     }
 
+    static Vectorized<c10::qint8> loadu(const void* ptr, int64_t count) {
+        __at_align__ value_type tmp_values[size()];
+        // Ensure uninitialized memory does not change the output value See https://github.com/pytorch/pytorch/issues/32502
+        // for more details. We do not initialize arrays to zero using "={0}" because gcc would compile it to two
+        // instructions while a loop would be compiled to one instruction.
+        for (const auto i : c10::irange(size())) {
+          tmp_values[i] = 0;
+        }
+        std::memcpy(
+            tmp_values, reinterpret_cast<const value_type*>(ptr), count * sizeof(value_type));
+        return _mm256_loadu_si256((const __m256i*)tmp_values);
+    }
+
  private:
     __m256i cvtepi8_epi32(__m128i epi8_vals) const {
         return _mm256_cvtepi8_epi32(epi8_vals);
@@ -442,7 +470,7 @@ struct Vectorized<c10::qint8> : public Vectorizedqi {
  public:
   float_vec_return_type dequantize(
       Vectorized<float> scale,
-      Vectorized<float> zero_point,
+      Vectorized<float> /*zero_point*/,
       Vectorized<float> scale_neg_zp_premul) const {
     __m128i int_val0 = _mm_set1_epi64x(_mm256_extract_epi64(vals, 0));
     __m128i int_val1 = _mm_set1_epi64x(_mm256_extract_epi64(vals, 1));
@@ -467,7 +495,7 @@ struct Vectorized<c10::qint8> : public Vectorizedqi {
 
   static Vectorized<c10::qint8> quantize(
       const float_vec_return_type& rhs,
-      float scale,
+      float /*scale*/,
       int32_t zero_point,
       float inverse_scale) {
     auto* rhs_data = (float*)rhs.data();
@@ -580,10 +608,12 @@ struct Vectorized<c10::quint8> : public Vectorizedqi {
     }
 
     // NOLINTNEXTLINE(clang-diagnostic-deprecated-copy)
-    #pragma clang diagnostic push
-    #pragma clang diagnostic ignored "-Wdeprecated-copy"
+    C10_CLANG_DIAGNOSTIC_PUSH()
+    #if C10_CLANG_HAS_WARNING("-Wdeprecated-copy")
+    C10_CLANG_DIAGNOSTIC_IGNORE("-Wdeprecated-copy")
+    #endif
     Vectorized(const Vectorized<c10::quint8>& other) : Vectorizedqi(other.vals) { }
-    #pragma clang diagnostic pop
+    C10_CLANG_DIAGNOSTIC_POP()
 
     void store(void* ptr, int count = size()) const {
         if (count != size()) {
@@ -597,6 +627,19 @@ struct Vectorized<c10::quint8> : public Vectorizedqi {
         return Vectorized<c10::quint8>(ptr);
     }
 
+    static Vectorized<c10::quint8> loadu(const void* ptr, int64_t count) {
+        __at_align__ value_type tmp_values[size()];
+        // Ensure uninitialized memory does not change the output value See https://github.com/pytorch/pytorch/issues/32502
+        // for more details. We do not initialize arrays to zero using "={0}" because gcc would compile it to two
+        // instructions while a loop would be compiled to one instruction.
+        for (const auto i : c10::irange(size())) {
+          tmp_values[i] = 0;
+        }
+        std::memcpy(
+            tmp_values, reinterpret_cast<const value_type*>(ptr), count * sizeof(value_type));
+        return _mm256_loadu_si256((const __m256i*)tmp_values);
+    }
+
  private:
     __m256i cvtepu8_epi32(__m128i epu8_vals) const {
         return _mm256_cvtepu8_epi32(epu8_vals);
@@ -605,7 +648,7 @@ struct Vectorized<c10::quint8> : public Vectorizedqi {
  public:
   float_vec_return_type dequantize(
       Vectorized<float> scale,
-      Vectorized<float> zero_point,
+      Vectorized<float> /*zero_point*/,
       Vectorized<float> scale_zp_premul) const {
     __m128i int_val0 = _mm_set1_epi64x(_mm256_extract_epi64(vals, 0));
     __m128i int_val1 = _mm_set1_epi64x(_mm256_extract_epi64(vals, 1));
@@ -630,7 +673,7 @@ struct Vectorized<c10::quint8> : public Vectorizedqi {
 
   static Vectorized<c10::quint8> quantize(
       const float_vec_return_type& rhs,
-      float scale,
+      float /*scale*/,
       int32_t zero_point,
       float inverse_scale) {
     auto* rhs_data = (float*)rhs.data();
@@ -763,7 +806,7 @@ struct VectorizedQuantizedConverter {
   float_vec_return_type dequantize(
       Vectorized<float> scale,
       Vectorized<float> zero_point,
-      Vectorized<float> scale_zp_premul) const {
+      Vectorized<float> /*scale_zp_premul*/) const {
     float_vec_return_type rv;
     for (const auto i : c10::irange(float_num_vecs())) {
       float tmp_vals[8];
@@ -816,11 +859,24 @@ struct Vectorized<c10::qint32> : public VectorizedQuantizedConverter<
     return Vectorized<c10::qint32>(ptr);
   }
 
+  static Vectorized<c10::qint32> loadu(const void* ptr, int64_t count) {
+    __at_align__ value_type tmp_values[size()];
+    // Ensure uninitialized memory does not change the output value See https://github.com/pytorch/pytorch/issues/32502
+    // for more details. We do not initialize arrays to zero using "={0}" because gcc would compile it to two
+    // instructions while a loop would be compiled to one instruction.
+    for (const auto i : c10::irange(size())) {
+      tmp_values[i] = 0;
+    }
+    std::memcpy(
+        tmp_values, reinterpret_cast<const value_type*>(ptr), count * sizeof(value_type));
+    return Vectorized<c10::qint32>(tmp_values);
+  }
+
   static Vectorized<c10::qint32> quantize(
       const float_vec_return_type& rhs,
       float scale,
       int32_t zero_point,
-      float inverse_scale) {
+      float /*inverse_scale*/) {
     std::array<value_type, size()> qvals;
     std::array<float, float_num_vecs() * 8> float_vals;
 
@@ -902,7 +958,7 @@ Vectorized<c10::qint32> inline operator*(
     const Vectorized<c10::qint32>& a,
     const Vectorized<c10::qint32>& b) {
   Vectorized<c10::qint32> retval;
-  for (size_t i = 0; i < std::decay_t<decltype(a)>::size(); ++i) {
+  for (const auto i : c10::irange(std::decay_t<decltype(a)>::size())) {
     retval.vals[i] = a.vals[i] * b.vals[i];
   }
   return retval;
@@ -913,7 +969,7 @@ Vectorized<c10::qint32> inline operator+(
     const Vectorized<c10::qint32>& a,
     const Vectorized<c10::qint32>& b) {
   Vectorized<c10::qint32> retval;
-  for (size_t i = 0; i < std::decay_t<decltype(a)>::size(); ++i) {
+  for (const auto i : c10::irange(std::decay_t<decltype(a)>::size())) {
     retval.vals[i] = a.vals[i] + b.vals[i];
   }
   return retval;
@@ -948,11 +1004,24 @@ struct Vectorized<c10::qint8> : public VectorizedQuantizedConverter<
     return Vectorized<c10::qint8>(ptr);
   }
 
+  static Vectorized<c10::qint8> loadu(const void* ptr, int64_t count) {
+    __at_align__ value_type tmp_values[size()];
+    // Ensure uninitialized memory does not change the output value See https://github.com/pytorch/pytorch/issues/32502
+    // for more details. We do not initialize arrays to zero using "={0}" because gcc would compile it to two
+    // instructions while a loop would be compiled to one instruction.
+    for (const auto i : c10::irange(size())) {
+      tmp_values[i] = 0;
+    }
+    std::memcpy(
+        tmp_values, reinterpret_cast<const value_type*>(ptr), count * sizeof(value_type));
+    return Vectorized<c10::qint8>(tmp_values);
+  }
+
   static Vectorized<c10::qint8> quantize(
       const float_vec_return_type& rhs,
       float scale,
       int32_t zero_point,
-      float inverse_scale) {
+      float /*inverse_scale*/) {
     std::array<value_type, size()> qvals;
     std::array<float, float_num_vecs() * 8> float_vals;
 
@@ -1068,11 +1137,24 @@ struct Vectorized<c10::quint8> : public VectorizedQuantizedConverter<
     return Vectorized<c10::quint8>(ptr);
   }
 
+  static Vectorized<c10::quint8> loadu(const void* ptr, int64_t count) {
+    __at_align__ value_type tmp_values[size()];
+    // Ensure uninitialized memory does not change the output value See https://github.com/pytorch/pytorch/issues/32502
+    // for more details. We do not initialize arrays to zero using "={0}" because gcc would compile it to two
+    // instructions while a loop would be compiled to one instruction.
+    for (const auto i : c10::irange(size())) {
+      tmp_values[i] = 0;
+    }
+    std::memcpy(
+        tmp_values, reinterpret_cast<const value_type*>(ptr), count * sizeof(value_type));
+    return Vectorized<c10::quint8>(tmp_values);
+  }
+
   static Vectorized<c10::quint8> quantize(
       const float_vec_return_type& rhs,
       float scale,
       int32_t zero_point,
-      float inverse_scale) {
+      float /*inverse_scale*/) {
     std::array<value_type, size()> qvals;
     std::array<float, float_num_vecs() * 8> float_vals;
 

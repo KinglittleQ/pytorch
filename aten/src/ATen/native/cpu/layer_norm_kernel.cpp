@@ -1,15 +1,21 @@
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/native/layer_norm.h>
 
 #include <cmath>
 #include <tuple>
 
-#include <ATen/ATen.h>
-#include <ATen/CPUApplyUtils.h>
+#include <ATen/core/Tensor.h>
 #include <ATen/Dispatch.h>
 #include <ATen/cpu/vec/functional.h>
 #include <ATen/cpu/vec/vec.h>
 #include <ATen/native/cpu/moments_utils.h>
 #include <c10/util/irange.h>
+
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/Functions.h>
+#else
+#include <ATen/ops/empty.h>
+#endif
 
 namespace at {
 namespace native {
@@ -29,17 +35,20 @@ void LayerNormKernelImplInternal(
     Tensor* rstd) {
   using T_ACC = vec::vec_scalar_t<T>;
   using Vec = vec::Vectorized<T_ACC>;
-  DCHECK_EQ(X.numel(), M * N);
+  TORCH_DCHECK_EQ(X.numel(), M * N);
   DCHECK(!gamma.defined() || gamma.numel() == N);
   DCHECK(!beta.defined() || beta.numel() == N);
   const T* X_data = X.data_ptr<T>();
   const T* gamma_data = gamma.defined() ? gamma.data_ptr<T>() : nullptr;
   const T* beta_data = beta.defined() ? beta.data_ptr<T>() : nullptr;
   T* Y_data = Y->data_ptr<T>();
-  T* mean_data = mean->data_ptr<T>();
-  T* rstd_data = rstd->data_ptr<T>();
+  T* mean_data = mean ? mean->data_ptr<T>() : nullptr;
+  T* rstd_data = rstd ? rstd->data_ptr<T>() : nullptr;
+
   const bool gamma_null = gamma_data == nullptr;
   const bool beta_null = beta_data == nullptr;
+  const bool mean_null = mean_data == nullptr;
+  const bool rstd_null = rstd_data == nullptr;
   at::parallel_for(0, M, 1, [&](int64_t start, int64_t end) {
     for (const auto i : c10::irange(start, end)) {
       const T* X_ptr = X_data + i * N;
@@ -67,8 +76,12 @@ void LayerNormKernelImplInternal(
             beta_data,
             N);
       }
-      mean_data[i] = mean_val;
-      rstd_data[i] = rstd_val;
+      if (!mean_null) {
+        mean_data[i] = mean_val;
+      }
+      if (!rstd_null) {
+        rstd_data[i] = rstd_val;
+      }
     }
   });
 }
@@ -104,10 +117,10 @@ void LayerNormBackwardKernelImplInternal(
     Tensor* dbeta) {
   using T_ACC = vec::vec_scalar_t<T>;
   using Vec = vec::Vectorized<T_ACC>;
-  DCHECK_EQ(dY.numel(), M * N);
-  DCHECK_EQ(X.numel(), M * N);
-  DCHECK_EQ(mean.numel(), M);
-  DCHECK_EQ(rstd.numel(), M);
+  TORCH_DCHECK_EQ(dY.numel(), M * N);
+  TORCH_DCHECK_EQ(X.numel(), M * N);
+  TORCH_DCHECK_EQ(mean.numel(), M);
+  TORCH_DCHECK_EQ(rstd.numel(), M);
   DCHECK(!gamma.defined() || gamma.numel() == N);
   const T* dY_data = dY.template data_ptr<T>();
   const T* X_data = X.template data_ptr<T>();
